@@ -14,7 +14,9 @@ const themeOptions: { id: Theme; label: string }[] = [
 
 const view = ref<SettingsView | null>(null);
 const s = computed(() => view.value?.settings);
-const autostart = ref(false);
+// Unknown until the task lookup returns, which is slower than the settings: rendering the switch
+// early would animate it from off to its real state every time the page opens.
+const autostart = ref<boolean | null>(null);
 const lan = ref<LanState | null>(null);
 const peerName = ref("");
 const peerCode = ref("");
@@ -269,7 +271,8 @@ onUnmounted(() => {
             <div class="name">开机自启</div>
             <div class="desc">创建当前用户登录时以管理员权限运行的计划任务，启动后静默到托盘；关闭时删除任务。</div>
           </div>
-          <input type="checkbox" class="switch" :checked="autostart" @change="toggleAutostart" />
+          <input v-if="autostart !== null" type="checkbox" class="switch" :checked="autostart" @change="toggleAutostart" />
+          <span v-else class="switch-placeholder" aria-hidden="true"></span>
         </label>
         <label class="row">
           <div class="label">

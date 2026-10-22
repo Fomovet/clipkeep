@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, applyTheme } from "../api";
@@ -10,6 +10,9 @@ const autostart = ref(false);
 const hotkey = ref("");
 const busy = ref(false);
 const error = ref("");
+// The menu is rendered only once its state is known, so the switches appear in place instead of
+// animating from their defaults each time the menu opens.
+const loaded = ref(false);
 const status = computed(() => paused.value ? "已暂停" : "记录中");
 const unlisteners: UnlistenFn[] = [];
 
@@ -27,6 +30,8 @@ async function refresh() {
     error.value = "";
   } catch (e) {
     error.value = String(e);
+  } finally {
+    loaded.value = true;
   }
 }
 
@@ -65,6 +70,9 @@ onMounted(async () => {
     await listen("settings-changed", refresh),
   );
   await refresh();
+  await nextTick();
+  // The window is created on demand and stays hidden until it has something to show.
+  await invoke("tray_menu_ready");
 });
 
 function preventContextMenu(e: MouseEvent) { e.preventDefault(); }
@@ -77,7 +85,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="tray-shell menu-surface">
+  <div v-if="loaded" class="tray-shell menu-surface">
     <header class="menu-label tray-head">
       <strong>clipkeep</strong>
       <span class="tray-status" :class="{ paused }"><i></i>{{ status }}</span>

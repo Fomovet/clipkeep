@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "clipkeep"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arboard",
  "base64 0.23.1",
@@ -632,6 +632,8 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-dialog",
  "tauri-plugin-single-instance",
+ "webview2-com",
+ "windows-core",
  "windows-sys 0.61.2",
 ]
 

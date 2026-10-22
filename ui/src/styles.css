@@ -240,6 +240,12 @@ button:focus-visible {
 .switch:checked {
   background: var(--accent);
 }
+/* Holds a switch's place while its state is still loading. */
+.switch-placeholder {
+  flex-shrink: 0;
+  width: 38px;
+  height: 20px;
+}
 .switch:checked::after {
   transform: translateX(18px);
 }

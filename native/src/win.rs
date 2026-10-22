@@ -10,6 +10,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Globalization::{CP_OEMCP, MultiByteToWideChar};
+use windows_sys::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
@@ -79,6 +81,8 @@ static LAST_TARGET_WAS_HELD: AtomicBool = AtomicBool::new(false);
 /// cannot do any UI work (run_on_main_thread, etc.) inside the hook. A dedicated dispatcher
 /// thread watches this counter and calls the actual callback outside the hook.
 static HOTKEY_FIRE_COUNT: AtomicU64 = AtomicU64::new(0);
+/// The dispatcher thread, unparked by the hook so a press is handled without polling delay.
+static DISPATCHER: OnceLock<thread::Thread> = OnceLock::new();
 
 pub fn start_hotkey_diagnostics(data_dir: &Path) {
     // Require an explicit opt-in so an empty marker cannot keep a release log growing forever.
@@ -182,8 +186,8 @@ fn install_hook() -> HHOOK {
 
 /// Install the keyboard hook and start the dispatcher thread.
 ///
-/// The hook itself never calls the callback — it only increments HOTKEY_FIRE_COUNT and returns
-/// immediately.  The dispatcher thread wakes every 5 ms, sees the counter change, and calls
+/// The hook itself never calls the callback — it only increments HOTKEY_FIRE_COUNT, unparks the
+/// dispatcher thread and returns immediately. The dispatcher sees the counter change and calls
 /// the callback there (outside the hook's timeout).
 pub fn install_hotkey_hook(callback: impl Fn() + Send + Sync + 'static) {
     if ON_HOTKEY.set(Box::new(callback)).is_err() {
@@ -191,12 +195,13 @@ pub fn install_hotkey_hook(callback: impl Fn() + Send + Sync + 'static) {
     }
 
     // Dispatcher thread: calls once for each physical press, outside the hook deadline.
-    thread::spawn(|| {
+    let dispatcher = thread::spawn(|| {
         let mut last_seen: u64 = 0;
         let mut last_snapshot = String::new();
         let mut next_snapshot = Instant::now();
         loop {
-            thread::sleep(Duration::from_millis(5));
+            // The timeout only paces diagnostic snapshots; presses unpark the thread at once.
+            thread::park_timeout(Duration::from_secs(1));
             let cur = HOTKEY_FIRE_COUNT.load(Ordering::Relaxed);
             while last_seen < cur {
                 last_seen += 1;
@@ -215,6 +220,7 @@ pub fn install_hotkey_hook(callback: impl Fn() + Send + Sync + 'static) {
             }
         }
     });
+    let _ = DISPATCHER.set(dispatcher.thread().clone());
 
     // Hook thread: owns the message pump required for WH_KEYBOARD_LL.
     thread::spawn(|| unsafe {
@@ -386,11 +392,54 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                     send_keys(&[(VK_MASK, false), (VK_MASK, true)]);
                 }
                 HOTKEY_FIRE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if let Some(dispatcher) = DISPATCHER.get() {
+                    dispatcher.unpark();
+                }
                 return 1;
             }
         }
     }
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
+}
+
+/// Console tools such as schtasks write in the OEM code page (GBK on Chinese Windows), not UTF-8.
+pub fn oem_to_string(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let Ok(len) = i32::try_from(bytes.len()) else {
+        return String::from_utf8_lossy(bytes).into_owned();
+    };
+    unsafe {
+        let wide_len = MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), len, null_mut(), 0);
+        if wide_len <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        let mut wide = vec![0u16; wide_len as usize];
+        MultiByteToWideChar(
+            CP_OEMCP,
+            0,
+            bytes.as_ptr(),
+            len,
+            wide.as_mut_ptr(),
+            wide_len,
+        );
+        String::from_utf16_lossy(&wide)
+    }
+}
+
+/// Windows plays its open/close animation for captioned windows, which Tauri keeps even without
+/// decorations. A popup panel should appear and disappear at once.
+pub fn disable_transitions(hwnd: HWND) {
+    let disabled: i32 = 1;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+            (&disabled as *const i32).cast(),
+            size_of::<i32>() as u32,
+        );
+    }
 }
 
 /// Call right before showing our window, so a paste can go back to where the user was typing.

@@ -1,6 +1,7 @@
 mod atomic_file;
 mod clipboard;
 mod db;
+mod dib;
 mod images;
 mod lan;
 mod settings;
@@ -29,6 +30,8 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const AUTOSTART_ARG: &str = "--minimized";
 const AUTOSTART_TASK: &str = "\\clipkeep-clipboard";
+/// Written next to the exe by the installer on a first install (see installer-hooks.nsh).
+const AUTOSTART_MARKER: &str = "autostart.pending";
 const BUNDLE_VERSION: u32 = 1;
 const MAX_IMPORT_FILE: u64 = 2 * 1024 * 1024 * 1024;
 /// Window won't auto-hide on blur until this epoch-ms (briefly after show or while dragging).
@@ -47,6 +50,12 @@ static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(false);
 static TRAY_MENU_VISIBLE: AtomicBool = AtomicBool::new(false);
 static TRAY_MENU_EPOCH: AtomicU64 = AtomicU64::new(0);
 static TRAY_MENU_BLUR_GRACE_UNTIL: AtomicI64 = AtomicI64::new(0);
+/// The tray menu window is being built, so a second right-click doesn't build another.
+static TRAY_MENU_CREATING: AtomicBool = AtomicBool::new(false);
+/// The tray menu page has loaded its state and can be shown.
+static TRAY_MENU_READY: AtomicBool = AtomicBool::new(false);
+/// Where the menu was requested; it may only be shown once its page has loaded.
+static TRAY_MENU_POINTER: Mutex<Option<PhysicalPosition<f64>>> = Mutex::new(None);
 
 struct Core {
     db: Mutex<Connection>,
@@ -512,42 +521,129 @@ fn autostart_task_exists() -> bool {
     run_schtasks(&["/Query", "/TN", AUTOSTART_TASK]).is_ok_and(|output| output.status.success())
 }
 
+fn schtasks_error(output: &Output) -> String {
+    win::oem_to_string(&output.stderr).trim().to_owned()
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Stored in the task's description; bump it when the definition changes so older tasks get
+/// rewritten on startup.
+const AUTOSTART_TASK_VERSION: &str = "clipkeep-autostart-v2";
+
+/// `schtasks /SC ONLOGON` gets several defaults wrong for a resident app: it fires on any user's
+/// logon, won't start on battery, stops when unplugged, kills the process after 72 hours and runs
+/// it at below-normal priority. Spell every one of them out.
+fn autostart_task_xml(executable: &str, user: &str) -> String {
+    let (exe, user) = (xml_escape(executable), xml_escape(user));
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>{AUTOSTART_TASK_VERSION}</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe}</Command>
+      <Arguments>{AUTOSTART_ARG}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    )
+}
+
 fn create_autostart_task() -> CmdResult<()> {
     if cfg!(debug_assertions) {
         return Err("请使用发布版设置开机自启".into());
     }
     let executable = std::env::current_exe().map_err(to_err)?;
-    let task_run = format!("\"{}\" {AUTOSTART_ARG}", executable.display());
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(name)) => format!("{domain}\\{name}"),
+        (_, Ok(name)) => name,
+        _ => return Err("创建开机自启任务失败：无法确定当前用户".into()),
+    };
+    let xml = autostart_task_xml(&executable.display().to_string(), &user);
+    // schtasks reads the definition from a file, as UTF-16 to match the declaration.
+    let path = std::env::temp_dir().join(format!("clipkeep-autostart-{}.xml", std::process::id()));
+    let bytes: Vec<u8> = [0xFEFFu16]
+        .into_iter()
+        .chain(xml.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    std::fs::write(&path, bytes).map_err(to_err)?;
     let output = run_schtasks(&[
         "/Create",
-        "/SC",
-        "ONLOGON",
         "/TN",
         AUTOSTART_TASK,
-        "/TR",
-        &task_run,
-        "/RL",
-        "HIGHEST",
-        "/IT",
+        "/XML",
+        &path.display().to_string(),
         "/F",
-    ])?;
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let output = output?;
     if !output.status.success() {
-        return Err(format!(
-            "创建开机自启任务失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        return Err(format!("创建开机自启任务失败：{}", schtasks_error(&output)));
     }
     Ok(())
+}
+
+/// Rewrites a task left by an older version with the current definition, as long as it still
+/// starts this executable; one pointing at another copy is left to that copy.
+fn upgrade_autostart_task() {
+    let Ok(output) = run_schtasks(&["/Query", "/TN", AUTOSTART_TASK, "/XML"]) else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let task = win::oem_to_string(&output.stdout).to_lowercase();
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let executable = xml_escape(&executable.display().to_string()).to_lowercase();
+    if task.contains(AUTOSTART_TASK_VERSION) || !task.contains(&executable) {
+        return;
+    }
+    if let Err(e) = create_autostart_task() {
+        eprintln!("upgrading autostart task failed: {e}");
+    }
 }
 
 fn delete_autostart_task() -> CmdResult<()> {
     if autostart_task_exists() {
         let output = run_schtasks(&["/Delete", "/TN", AUTOSTART_TASK, "/F"])?;
         if !output.status.success() {
-            return Err(format!(
-                "删除开机自启任务失败：{}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            return Err(format!("删除开机自启任务失败：{}", schtasks_error(&output)));
         }
     }
     Ok(())
@@ -918,13 +1014,39 @@ fn tray_menu_window(app: &AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window("tray_menu")
 }
 
+/// The tray menu only exists while it is open: its WebView keeps a ~25MB renderer alive, and the
+/// menu is opened rarely. A closed menu is destroyed rather than hidden.
 fn hide_tray_menu_window(app: &AppHandle) {
     if !TRAY_MENU_VISIBLE.swap(false, Ordering::Relaxed) {
         return;
     }
     TRAY_MENU_EPOCH.fetch_add(1, Ordering::Relaxed);
-    if let Some(window) = tray_menu_window(app) {
-        let _ = window.hide();
+    // A menu still loading is destroyed by tray_menu_ready once it notices it isn't wanted.
+    if TRAY_MENU_READY.load(Ordering::Relaxed)
+        && let Some(window) = tray_menu_window(app)
+    {
+        destroy_tray_menu(&window);
+    }
+}
+
+fn destroy_tray_menu(window: &WebviewWindow) {
+    TRAY_MENU_READY.store(false, Ordering::Relaxed);
+    if let Err(e) = window.destroy() {
+        win::log_diagnostic(&format!("destroy-tray-menu-failed {e}"));
+    }
+}
+
+/// The page has rendered its state: show the menu if it is still wanted.
+#[tauri::command]
+fn tray_menu_ready(app: AppHandle) {
+    TRAY_MENU_READY.store(true, Ordering::Relaxed);
+    let Some(window) = tray_menu_window(&app) else {
+        return;
+    };
+    if TRAY_MENU_VISIBLE.load(Ordering::Relaxed) {
+        reveal_tray_menu(&app, &window);
+    } else {
+        destroy_tray_menu(&window);
     }
 }
 
@@ -943,15 +1065,61 @@ fn popup_axis(pointer: i32, extent: i32, start: i32, end: i32) -> i32 {
 }
 
 fn show_tray_menu(app: &AppHandle, cursor: PhysicalPosition<f64>) {
-    let Some(window) = tray_menu_window(app) else {
-        return;
-    };
+    let pointer = app.cursor_position().unwrap_or(cursor);
+    if let Ok(mut slot) = TRAY_MENU_POINTER.lock() {
+        *slot = Some(pointer);
+    }
     TRAY_MENU_EPOCH.fetch_add(1, Ordering::Relaxed);
+    TRAY_MENU_VISIBLE.store(true, Ordering::Relaxed);
+    if let Some(window) = tray_menu_window(app) {
+        // Still loading: tray_menu_ready reveals it at the latest pointer.
+        if TRAY_MENU_READY.load(Ordering::Relaxed) {
+            reveal_tray_menu(app, &window);
+        }
+        return;
+    }
+    if TRAY_MENU_CREATING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Building a WebView on the event-loop thread can deadlock on Windows while it waits for
+    // WebView2, so build elsewhere and let the builder hand the work to the main thread.
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let built = app
+            .config()
+            .app
+            .windows
+            .iter()
+            .find(|config| config.label == "tray_menu")
+            .ok_or_else(|| "tray menu window is not configured".to_string())
+            .and_then(|config| {
+                tauri::WebviewWindowBuilder::from_config(&app, config)
+                    .and_then(|builder| builder.build())
+                    .map_err(to_err)
+            });
+        TRAY_MENU_CREATING.store(false, Ordering::Relaxed);
+        match built {
+            Ok(window) => {
+                if let Ok(hwnd) = window.hwnd() {
+                    win::disable_transitions(hwnd.0 as _);
+                }
+            }
+            Err(e) => {
+                TRAY_MENU_VISIBLE.store(false, Ordering::Relaxed);
+                win::log_diagnostic(&format!("create-tray-menu-failed {e}"));
+            }
+        }
+    });
+}
+
+fn reveal_tray_menu(app: &AppHandle, window: &WebviewWindow) {
     TRAY_MENU_BLUR_GRACE_UNTIL.store(db::now_ms() + 120, Ordering::Relaxed);
     let Ok(size) = window.outer_size() else {
         return;
     };
-    let pointer = app.cursor_position().unwrap_or(cursor);
+    let Some(pointer) = TRAY_MENU_POINTER.lock().ok().and_then(|slot| *slot) else {
+        return;
+    };
     let mut x = pointer.x.round() as i32 + 6;
     let mut y = pointer.y.round() as i32 + 6;
     if let Ok(Some(monitor)) = app.monitor_from_point(pointer.x, pointer.y) {
@@ -964,12 +1132,11 @@ fn show_tray_menu(app: &AppHandle, cursor: PhysicalPosition<f64>) {
         y = popup_axis(pointer.y.round() as i32, size.height as i32, top, bottom);
     }
     let _ = window.set_position(PhysicalPosition::new(x, y));
-    // Windows can restore the native caption while this secondary window is
-    // hidden. Enforce the borderless style immediately before every show.
+    // Windows can restore the native caption on this secondary window. Enforce the borderless
+    // style immediately before every show.
     if let Err(e) = window.set_decorations(false) {
         win::log_diagnostic(&format!("style-tray-menu-failed {e}"));
     }
-    TRAY_MENU_VISIBLE.store(true, Ordering::Relaxed);
     if let Err(e) = window.show() {
         TRAY_MENU_VISIBLE.store(false, Ordering::Relaxed);
         win::log_diagnostic(&format!("show-tray-menu-failed {e}"));
@@ -977,6 +1144,29 @@ fn show_tray_menu(app: &AppHandle, cursor: PhysicalPosition<f64>) {
     }
     let _ = window.set_focus();
     let _ = window.emit("tray-menu-shown", ());
+}
+
+#[cfg(test)]
+mod autostart_task_tests {
+    use super::{AUTOSTART_TASK_VERSION, autostart_task_xml};
+
+    #[test]
+    fn task_runs_on_battery_without_time_limit_for_this_user() {
+        let xml = autostart_task_xml(r"C:\Users\张三\A&B\clipkeep.exe", r"PC\张三");
+        for setting in [
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+            "<Priority>4</Priority>",
+            "<RunLevel>HighestAvailable</RunLevel>",
+            AUTOSTART_TASK_VERSION,
+        ] {
+            assert!(xml.contains(setting), "missing {setting}");
+        }
+        // The logon trigger and the principal both name the user.
+        assert_eq!(xml.matches(r"<UserId>PC\张三</UserId>").count(), 2);
+        assert!(xml.contains(r"<Command>C:\Users\张三\A&amp;B\clipkeep.exe</Command>"));
+    }
 }
 
 #[cfg(test)]
@@ -993,7 +1183,12 @@ mod popup_position_tests {
 }
 
 fn on_tray_menu_focus_changed(app: &AppHandle, focused: bool) {
-    if focused || !TRAY_MENU_VISIBLE.load(Ordering::Relaxed) {
+    // A freshly built window reports a blur while its page is still loading, before it was ever
+    // shown; that must not cancel the menu the user just asked for.
+    if focused
+        || !TRAY_MENU_VISIBLE.load(Ordering::Relaxed)
+        || !TRAY_MENU_READY.load(Ordering::Relaxed)
+    {
         return;
     }
     let epoch = TRAY_MENU_EPOCH.load(Ordering::Relaxed);
@@ -1046,6 +1241,30 @@ fn tray_menu_action(app: AppHandle, action: String) -> CmdResult<()> {
     Ok(())
 }
 
+/// The panel is hidden most of the time; a low target lets WebView2 trim its renderer meanwhile.
+fn set_low_memory(window: &WebviewWindow, low: bool) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+        ICoreWebView2_19,
+    };
+    use windows_core::Interface;
+
+    let level = if low {
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+    } else {
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+    };
+    let _ = window.with_webview(move |webview| unsafe {
+        // ICoreWebView2_19 needs WebView2 Runtime 114+; older runtimes simply keep the default.
+        if let Ok(core) = webview.controller().CoreWebView2()
+            && let Ok(core) = core.cast::<ICoreWebView2_19>()
+            && let Err(e) = core.SetMemoryUsageTargetLevel(level)
+        {
+            win::log_diagnostic(&format!("set-memory-level-failed {e}"));
+        }
+    });
+}
+
 fn hide_main(app: &AppHandle) {
     win::log_diagnostic("hide-main");
     FOCUS_EPOCH.fetch_add(1, Ordering::Relaxed);
@@ -1056,6 +1275,7 @@ fn hide_main(app: &AppHandle) {
         if let Err(e) = w.hide() {
             win::log_diagnostic(&format!("hide-main-failed {e}"));
         }
+        set_low_memory(&w, true);
     }
     if let Some(core) = app.try_state::<Core>() {
         core.persist_position();
@@ -1072,6 +1292,7 @@ fn show_main(app: &AppHandle) {
         return;
     };
     win::remember_foreground();
+    set_low_memory(&w, false);
     place_window(app, &w);
     let _ = w.unminimize();
     // Showing and focusing the WebView can emit a transient blur event.
@@ -1296,6 +1517,30 @@ pub fn run() {
                     eprintln!("removing legacy autostart entry failed: {e}");
                 }
             }
+            if let Ok(marker) =
+                std::env::current_exe().map(|exe| exe.with_file_name(AUTOSTART_MARKER))
+                && marker.exists()
+            {
+                // Keep the marker on failure so the next launch tries again.
+                match create_autostart_task() {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&marker);
+                    }
+                    Err(e) => eprintln!("enabling autostart after install failed: {e}"),
+                }
+            }
+            if !cfg!(debug_assertions) {
+                // Two schtasks round trips; keep them off the startup path.
+                std::thread::spawn(upgrade_autostart_task);
+            }
+            for window in [main_window(&handle), tray_menu_window(&handle)]
+                .into_iter()
+                .flatten()
+            {
+                if let Ok(hwnd) = window.hwnd() {
+                    win::disable_transitions(hwnd.0 as _);
+                }
+            }
             build_tray(&handle)?;
 
             let db = open_db(&data_dir).map_err(std::io::Error::other)?;
@@ -1330,6 +1575,9 @@ pub fn run() {
 
             if !std::env::args().any(|a| a == AUTOSTART_ARG) {
                 show_main(&handle);
+            } else if let Some(w) = main_window(&handle) {
+                // Started at logon into the tray: hidden until the first hotkey.
+                set_low_memory(&w, true);
             }
             Ok(())
         })
@@ -1386,6 +1634,7 @@ pub fn run() {
             copy_clip,
             hide_window,
             hide_tray_menu,
+            tray_menu_ready,
             tray_menu_action,
             start_drag,
             toggle_keep_on_blur,

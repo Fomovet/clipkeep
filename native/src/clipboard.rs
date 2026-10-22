@@ -235,6 +235,24 @@ impl OpenedClipboard {
         }
     }
 
+    /// Copies one clipboard format's bytes.
+    fn read(&self, format: u32) -> Option<Vec<u8>> {
+        unsafe {
+            let handle = GetClipboardData(format);
+            if handle.is_null() {
+                return None;
+            }
+            let len = GlobalSize(handle);
+            let ptr = GlobalLock(handle) as *const u8;
+            if ptr.is_null() {
+                return None;
+            }
+            let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+            GlobalUnlock(handle);
+            Some(bytes)
+        }
+    }
+
     fn size_of(&self, format: u32) -> usize {
         unsafe {
             let handle = GetClipboardData(format);
@@ -356,6 +374,18 @@ fn too_large() -> bool {
     false
 }
 
+/// Decodes the clipboard bitmap ourselves when arboard can't (see `dib`). DIBV5 first, since it
+/// may carry alpha; CF_DIB is what Windows synthesizes it from, or vice versa.
+fn read_dib_fallback() -> Option<Rgba> {
+    let cb = OpenedClipboard::open()?;
+    [CF_DIBV5, CF_DIB].into_iter().find_map(|format| unsafe {
+        if IsClipboardFormatAvailable(format) == 0 {
+            return None;
+        }
+        cb.read(format).and_then(|bytes| crate::dib::decode(&bytes))
+    })
+}
+
 /// Retry delays for clipboard read operations (exponential backoff).
 /// Other clipboard listeners can briefly hold the clipboard open; we retry with increasing delays.
 const CLIPBOARD_RETRY_DELAYS: [Duration; 3] = [
@@ -435,6 +465,14 @@ fn read_with_retry(retry_delays: &[Duration]) -> Option<Captured> {
                 height: img.height as u32,
                 pixels: img.bytes.into_owned(),
             })),
+            // A decode failure won't go away on retry; try our own DIB decoder instead.
+            Err(arboard::Error::ConversionFailure) => {
+                let img = read_dib_fallback();
+                if img.is_none() {
+                    eprintln!("clipboard image could not be decoded");
+                }
+                img.map(Captured::Image)
+            }
             Err(e) => {
                 if attempt < retry_delays.len() {
                     thread::sleep(retry_delays[attempt]);

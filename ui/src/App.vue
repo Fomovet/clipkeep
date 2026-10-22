@@ -11,12 +11,18 @@ const scope = ref<Scope>("all");
 const activeGroup = ref<number | null>(null);
 const query = ref("");
 const clips = ref<Clip[]>([]);
+// Rows are rendered in steps: all 1000 cost the renderer ~40MB while a screenful is visible.
+const RENDER_STEP = 100;
+// Shortest row (one line of text) plus its gap, for working out how many rows a scroll offset spans.
+const MIN_ROW_HEIGHT = 74;
+const renderLimit = ref(RENDER_STEP);
+const visibleClips = computed(() => clips.value.slice(0, renderLimit.value));
 const groups = ref<Group[]>([]);
 const selected = ref(0);
 const pinnedWindow = ref(false);
 const searchEl = ref<HTMLInputElement | null>(null);
 const listEl = ref<HTMLElement | null>(null);
-const showBackToTop = ref(false);
+const listScrolled = ref(false);
 const groupPicker = reactive({ open: false, x: 0, y: 0 });
 const groupPickerSearchEl = ref<HTMLInputElement | null>(null);
 const groupFilter = ref("");
@@ -72,11 +78,17 @@ async function reload(keepScroll = false) {
   const prev = keepScroll ? (listEl.value?.scrollTop ?? 0) : 0;
   const rows = await api.listClips(scope.value, activeGroup.value, query.value);
   if (seq !== loadSeq) return;
+  // A refresh keeps the rows already rendered; a fresh load renders enough to reach the
+  // remembered scroll position.
+  if (!keepScroll) {
+    const viewport = listEl.value?.clientHeight ?? 0;
+    renderLimit.value = Math.max(RENDER_STEP, Math.ceil((restoreScroll + viewport) / MIN_ROW_HEIGHT) + RENDER_STEP);
+  }
   clips.value = rows;
   if (selected.value >= rows.length) selected.value = Math.max(0, rows.length - 1);
   nextTick(() => {
     if (listEl.value) listEl.value.scrollTop = keepScroll ? prev : restoreScroll;
-    showBackToTop.value = (listEl.value?.scrollTop ?? 0) > 0;
+    listScrolled.value = (listEl.value?.scrollTop ?? 0) > 0;
     restoreScroll = 0;
   });
 }
@@ -172,7 +184,8 @@ async function savePreview() {
   }
 }
 
-async function loadSendPeers(generation: number) {
+// `focus` moves into the menu once loaded; a menu opened by hovering leaves focus on its parent.
+async function loadSendPeers(generation: number, focus: boolean) {
   sendLoading.value = true;
   sendLoadError.value = false;
   sendError.value = "";
@@ -189,29 +202,29 @@ async function loadSendPeers(generation: number) {
       sendLoading.value = false;
       fitMenu(sendMenu, ".send-menu");
       nextTick(() => {
-        if (generation === menuGeneration && sendMenu.open)
+        if (focus && generation === menuGeneration && sendMenu.open)
           (document.querySelector(".send-menu .menu-row:not(:disabled)") as HTMLButtonElement | null)?.focus();
       });
     }
   }
 }
 
-function openSendMenu(c: Clip, e: MouseEvent) {
-  const generation = ++menuGeneration;
-  moveMenu.open = false;
-  clipMenu.open = false;
-  const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+function openSendMenu(c: Clip, row: HTMLElement, focus: boolean) {
+  closeSubmenus();
+  const generation = menuGeneration;
   sendMenu.clipId = c.id;
   lanPeers.value = [];
   sendLoading.value = true;
   sendError.value = "";
   sendLoadError.value = false;
   sendMenu.open = true;
-  placeMenu(sendMenu, r.right - 184, r.bottom + 4, ".send-menu");
-  nextTick(() => {
-    if (generation === menuGeneration) (document.querySelector(".send-menu") as HTMLElement | null)?.focus();
-  });
-  void loadSendPeers(generation);
+  placeSubmenu(sendMenu, row, ".send-menu");
+  if (focus) {
+    nextTick(() => {
+      if (generation === menuGeneration) (document.querySelector(".send-menu") as HTMLElement | null)?.focus();
+    });
+  }
+  void loadSendPeers(generation, focus);
 }
 
 async function sendTo(peer: LanPeer) {
@@ -377,15 +390,100 @@ async function onDrop(i: number) {
   await api.reorderGroups(arr.map((g) => g.id));
 }
 
-function openMoveMenu(c: Clip, e: MouseEvent) {
-  sendMenu.open = false;
-  clipMenu.open = false;
+function openMoveMenu(c: Clip, row: HTMLElement, focus: boolean) {
+  closeSubmenus();
   moveFilter.value = "";
-  const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
   moveMenu.open = true;
   moveMenu.clipId = c.id;
-  placeMenu(moveMenu, r.right - 224, r.bottom + 4, ".move-menu");
-  nextTick(() => (document.querySelector(".move-menu .menu-search input, .move-menu .menu-row:not(:disabled)") as HTMLElement | null)?.focus());
+  placeSubmenu(moveMenu, row, ".move-menu");
+  if (focus) nextTick(() => (document.querySelector(".move-menu .menu-search input, .move-menu .menu-row:not(:disabled)") as HTMLElement | null)?.focus());
+}
+
+// The clip menu's submenus cascade beside their row like native menus: the parent stays open,
+// hovering a row opens its submenu after a short pause, and a click or → opens it at once.
+type Submenu = "send" | "move";
+const SUBMENU_HOVER_MS = 150;
+let submenuTimer: number | undefined;
+const openSubmenu = computed<Submenu | null>(() => (sendMenu.open ? "send" : moveMenu.open ? "move" : null));
+
+function showSubmenu(kind: Submenu, row: HTMLElement, focus: boolean) {
+  window.clearTimeout(submenuTimer);
+  const c = menuClip.value;
+  if (!c) return;
+  if (kind === "send") openSendMenu(c, row, focus);
+  else openMoveMenu(c, row, focus);
+}
+
+function closeSubmenus() {
+  window.clearTimeout(submenuTimer);
+  menuGeneration++;
+  moveMenu.open = false;
+  sendMenu.open = false;
+  sendLoading.value = false;
+  sendError.value = "";
+  sendLoadError.value = false;
+}
+
+function onClipMenuHover(e: MouseEvent) {
+  const row = (e.target as HTMLElement).closest(".menu-row") as HTMLElement | null;
+  if (!row) return;
+  const kind = (row.dataset.submenu as Submenu | undefined) ?? null;
+  window.clearTimeout(submenuTimer);
+  if (kind === openSubmenu.value) return;
+  submenuTimer = window.setTimeout(() => {
+    if (!clipMenu.open) return;
+    if (kind) showSubmenu(kind, row, false);
+    else closeSubmenus();
+  }, SUBMENU_HOVER_MS);
+}
+
+// Reaching the submenu cancels a close scheduled by rows crossed on the way.
+function keepSubmenu() {
+  window.clearTimeout(submenuTimer);
+}
+
+function focusSubmenuRow(kind: Submenu) {
+  nextTick(() => (document.querySelector(`.clip-menu [data-submenu="${kind}"]`) as HTMLElement | null)?.focus());
+}
+
+// Widest submenu (.move-menu), so the clip menu can keep a side free for it.
+const SUBMENU_WIDTH = 196;
+// Submenus tuck 4px under their parent's edge, as native menus do.
+const SUBMENU_OVERLAP = 4;
+
+function placeSubmenu(menu: { x: number; y: number }, row: HTMLElement, selector: string) {
+  const parent = (row.closest(".menu") as HTMLElement).getBoundingClientRect();
+  menu.x = parent.right - SUBMENU_OVERLAP;
+  menu.y = row.getBoundingClientRect().top - 5;
+  nextTick(() => {
+    const el = document.querySelector(selector) as HTMLElement | null;
+    if (!el) return;
+    // Right of the parent when it fits, else left. Only a window narrower than both menus
+    // together leaves the clamp below to overlap them.
+    if (parent.right - SUBMENU_OVERLAP + el.offsetWidth > window.innerWidth - 8 && parent.left + SUBMENU_OVERLAP - el.offsetWidth >= 8) {
+      menu.x = parent.left + SUBMENU_OVERLAP - el.offsetWidth;
+    }
+    menu.x = Math.max(8, Math.min(menu.x, window.innerWidth - el.offsetWidth - 8));
+    menu.y = Math.max(8, Math.min(menu.y, window.innerHeight - el.offsetHeight - 8));
+  });
+}
+
+// Shift the clip menu just enough that a submenu fits beside it on one side. Doing it when the
+// menu opens keeps it from jumping once a submenu is hovered.
+function leaveRoomForSubmenus(anchorX: number) {
+  nextTick(() => {
+    const el = document.querySelector(".clip-menu") as HTMLElement | null;
+    if (!el) return;
+    const width = el.offsetWidth;
+    const maxRight = window.innerWidth - 8;
+    const needRight = clipMenu.x + width - SUBMENU_OVERLAP + SUBMENU_WIDTH - maxRight;
+    const needLeft = 8 - (clipMenu.x + SUBMENU_OVERLAP - SUBMENU_WIDTH);
+    if (needRight <= 0 || needLeft <= 0) return;
+    // Both menus side by side nearly fill this narrow window. Keep the menu under where it was
+    // opened: submenus to the right when that was in the left half, else to the left.
+    const towardRight = anchorX <= window.innerWidth / 2;
+    clipMenu.x = towardRight ? Math.max(8, clipMenu.x - needRight) : Math.min(maxRight - width, clipMenu.x + needLeft);
+  });
 }
 
 function dismissMenuBeforeItemClick(e: MouseEvent) {
@@ -396,13 +494,8 @@ function dismissMenuBeforeItemClick(e: MouseEvent) {
 }
 
 function closeMenus() {
-  menuGeneration++;
+  closeSubmenus();
   groupPicker.open = false;
-  moveMenu.open = false;
-  sendMenu.open = false;
-  sendLoading.value = false;
-  sendError.value = "";
-  sendLoadError.value = false;
   clipMenu.open = false;
   groupMenu.open = false;
   groupEditor.open = false;
@@ -446,9 +539,11 @@ function openClipMenu(c: Clip, e: MouseEvent) {
   selected.value = Math.max(0, clips.value.findIndex((row) => row.id === c.id));
   if (e.type === "contextmenu") {
     placeMenu(clipMenu, e.clientX + 4, e.clientY + 4, ".clip-menu", true);
+    leaveRoomForSubmenus(e.clientX);
   } else {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     placeMenu(clipMenu, r.right - 188, r.bottom + 4, ".clip-menu");
+    leaveRoomForSubmenus(r.left + r.width / 2);
   }
   nextTick(() => (document.querySelector(".clip-menu .menu-row") as HTMLButtonElement | null)?.focus());
 }
@@ -464,8 +559,13 @@ function menuAction(action: "copy" | "preview" | "favorite" | "pin" | "delete") 
   else remove(c);
 }
 async function moveTo(groupId: number | null) {
-  await api.moveClip(moveMenu.clipId, groupId);
-  moveMenu.open = false;
+  const id = moveMenu.clipId;
+  closeMenus();
+  try {
+    await api.moveClip(id, groupId);
+  } catch (e) {
+    flash(`移动失败：${e}`);
+  }
 }
 
 function move(delta: number) {
@@ -494,27 +594,31 @@ function onKey(e: KeyboardEvent) {
     }
     return;
   }
-  if (sendMenu.open) {
-    if (e.key === "Escape") {
-      closeMenus();
+  const submenu = openSubmenu.value;
+  const active = document.activeElement as HTMLElement | null;
+  // A hovered submenu can be open while focus is still on the parent menu.
+  if (submenu && !active?.closest(".clip-menu")) {
+    // Back out of the submenu to its row; the arrow is left alone while typing in its search box.
+    if (e.key === "Escape" || (e.key === "ArrowLeft" && !(e.target instanceof HTMLInputElement))) {
+      closeSubmenus();
       e.preventDefault();
-      nextTick(() => searchEl.value?.focus());
-    }
-    return;
-  }
-  if (moveMenu.open) {
-    if (e.key === "Escape") {
-      moveMenu.open = false;
-      e.preventDefault();
-      nextTick(() => searchEl.value?.focus());
+      focusSubmenuRow(submenu);
     }
     return;
   }
   if (clipMenu.open) {
+    const row = active;
+    const kind = row?.dataset.submenu as Submenu | undefined;
     if (e.key === "Escape") {
-      clipMenu.open = false;
       e.preventDefault();
-      nextTick(() => searchEl.value?.focus());
+      if (submenu) closeSubmenus();
+      else {
+        clipMenu.open = false;
+        nextTick(() => searchEl.value?.focus());
+      }
+    } else if (kind && e.key === "ArrowRight") {
+      showSubmenu(kind, row!, true);
+      e.preventDefault();
     }
     return;
   }
@@ -570,8 +674,28 @@ function onKey(e: KeyboardEvent) {
   if (handled) e.preventDefault();
 }
 
+// Scrolling moves rows under a still cursor and Chromium reports that as mousemove. Only a real
+// pointer move should take the selection, so the wheel doesn't drag it along row by row.
+let lastPointer = { x: -1, y: -1 };
+function onItemHover(i: number, e: MouseEvent) {
+  if (e.screenX === lastPointer.x && e.screenY === lastPointer.y) return;
+  lastPointer = { x: e.screenX, y: e.screenY };
+  selected.value = i;
+}
+
+// Keyboard moves, previews and the like may select a row that isn't rendered yet.
+watch(selected, (index) => {
+  if (index >= renderLimit.value) renderLimit.value = index + RENDER_STEP;
+});
+
 function onScroll() {
-  showBackToTop.value = (listEl.value?.scrollTop ?? 0) > 0;
+  // Menus are fixed in place; once their row scrolls away they would point at nothing.
+  if (clipMenu.open) closeMenus();
+  const el = listEl.value;
+  if (el && renderLimit.value < clips.value.length && el.scrollTop + el.clientHeight > el.scrollHeight - 600) {
+    renderLimit.value += RENDER_STEP;
+  }
+  listScrolled.value = (listEl.value?.scrollTop ?? 0) > 0;
   window.clearTimeout(scrollTimer);
   scrollTimer = window.setTimeout(() => saveUi({ scrollTop: listEl.value?.scrollTop ?? 0 }), 200);
 }
@@ -580,7 +704,7 @@ function backToTop() {
   if (!listEl.value) return;
   listEl.value.scrollTop = 0;
   selected.value = 0;
-  showBackToTop.value = false;
+  listScrolled.value = false;
   window.clearTimeout(scrollTimer);
   saveUi({ scrollTop: 0 });
   nextTick(() => searchEl.value?.focus());
@@ -588,7 +712,10 @@ function backToTop() {
 
 function onHidden() {
   windowShown = false;
-  showBackToTop.value = false;
+  // Reset while hidden so the next show doesn't open on the old page or search.
+  page.value = "list";
+  query.value = "";
+  listScrolled.value = false;
   closeMenus();
   previewGeneration++;
   previewClip.value = null;
@@ -637,17 +764,17 @@ function backToList() {
 }
 
 async function onShown() {
-  page.value = "list";
-  query.value = "";
   onHidden();
   windowShown = true;
+  // The reload below covers a search cleared on hide whose debounced reload is still pending.
+  window.clearTimeout(searchTimer);
   // Restore keyboard control before the database refresh finishes.
   nextTick(() => searchEl.value?.focus());
   const ui = loadUi();
   restoreScroll = ui.scrollTop;
   selected.value = 0;
-  await reloadGroups();
-  // Restore the remembered tab, falling back to All if that group is gone.
+  // Groups stay current through groups-changed, so the remembered tab is restored right away
+  // (falling back to All if that group is gone) and the requests run together.
   if (ui.scope === "group" && groups.value.some((g) => g.id === ui.groupId)) {
     scope.value = "group";
     activeGroup.value = ui.groupId;
@@ -655,8 +782,8 @@ async function onShown() {
     scope.value = ui.scope === "fav" ? "fav" : "all";
     activeGroup.value = null;
   }
-  await reload();
-  paused.value = await api.getCapturePaused();
+  const [, , isPaused] = await Promise.all([reloadGroups(), reload(), api.getCapturePaused()]);
+  paused.value = isPaused;
 }
 
 function preventNativeContextMenu(event: MouseEvent) {
@@ -675,6 +802,8 @@ onMounted(async () => {
     await listen("settings-changed", syncSettings),
     await listen<boolean>("capture-paused-changed", (e) => (paused.value = e.payload)),
   );
+  // onShown restores the remembered group tab from the already loaded groups.
+  await reloadGroups();
   await onShown();
   await syncSettings();
 });
@@ -725,31 +854,36 @@ onUnmounted(() => {
         </div>
       </header>
 
-      <div class="search">
-        <ClipIcon name="search" />
-        <input ref="searchEl" v-model="query" placeholder="搜索文本…" spellcheck="false" />
-        <button v-if="query" class="icon-btn clear" title="清除" @click="query = ''"><ClipIcon name="close" /></button>
+      <div class="search-area" :class="{ scrolled: listScrolled }">
+        <div class="search">
+          <ClipIcon name="search" />
+          <input ref="searchEl" v-model="query" placeholder="搜索文本…" spellcheck="false" />
+          <button v-if="query" class="icon-btn clear" title="清除" @click="query = ''"><ClipIcon name="close" /></button>
+        </div>
+
+        <button v-if="paused" class="pause-banner" @click="api.toggleCapturePaused()">
+          <ClipIcon name="pause" /> 记录已暂停 · 点击继续
+        </button>
+        <div v-if="notice" class="notice-banner">{{ notice }}</div>
       </div>
 
-      <button v-if="paused" class="pause-banner" @click="api.toggleCapturePaused()">
-        <ClipIcon name="pause" /> 记录已暂停 · 点击继续
-      </button>
-      <div v-if="notice" class="notice-banner">{{ notice }}</div>
-
       <ul ref="listEl" class="list" @scroll="onScroll">
+        <!-- Clips are replaced, never mutated, so a row only re-renders when its inputs change
+             instead of all of them on every selection move. -->
         <li
-          v-for="(c, i) in clips"
+          v-for="(c, i) in visibleClips"
           :key="c.id"
+          v-memo="[c, i, i === selected, scope, groupName(c.groupId)]"
           class="item"
           :class="{ selected: i === selected, pinned: c.pinned }"
           :title="itemHint(c, i)"
-          @mousemove="selected = i"
+          @mousemove="onItemHover(i, $event)"
           @click.capture="dismissMenuBeforeItemClick"
           @click="paste(c)"
           @contextmenu="openClipMenu(c, $event)"
         >
           <div class="body" :class="{ 'image-body': c.kind === 'image' && c.thumb }">
-            <img v-if="c.kind === 'image' && c.thumb" class="thumb" :src="convertFileSrc(c.thumb)" :alt="c.source ? `${c.source} 的缩略图` : '剪贴板图片缩略图'" width="76" height="76" loading="lazy" draggable="false" />
+            <img v-if="c.kind === 'image' && c.thumb" class="thumb" :src="convertFileSrc(c.thumb)" :alt="c.source ? `${c.source} 的缩略图` : '剪贴板图片缩略图'" width="76" height="76" loading="lazy" decoding="async" draggable="false" />
             <div v-if="c.kind === 'image' && c.thumb" class="image-summary">
               <span class="image-name" :title="c.source || '剪贴板图片'">{{ c.source || '剪贴板图片' }}</span>
               <span v-if="c.width && c.height" class="image-dimensions">{{ c.width }} × {{ c.height }}</span>
@@ -796,7 +930,7 @@ onUnmounted(() => {
         </li>
       </ul>
       <button
-        v-if="showBackToTop && clips.length"
+        v-if="listScrolled && clips.length"
         class="back-to-top"
         type="button"
         title="回到顶部"
@@ -820,19 +954,19 @@ onUnmounted(() => {
       <button class="menu-row group-picker-add" @click.stop="openNewGroup($event)"><ClipIcon name="folder-plus" /><span class="menu-text">新建分组</span></button>
     </div>
 
-    <div v-if="clipMenu.open && menuClip" class="menu menu-surface clip-menu" :style="{ left: clipMenu.x + 'px', top: clipMenu.y + 'px' }" @click.stop>
+    <div v-if="clipMenu.open && menuClip" class="menu menu-surface clip-menu" :style="{ left: clipMenu.x + 'px', top: clipMenu.y + 'px' }" @click.stop @mouseover="onClipMenuHover">
       <button class="menu-row" @click="menuAction('copy')"><ClipIcon name="copy" /><span class="menu-text">仅复制</span><span class="menu-shortcut">Shift+Enter</span></button>
       <button v-if="menuClip.kind === 'text'" class="menu-row" @click="menuAction('preview')"><ClipIcon name="eye" /><span class="menu-text">查看 / 编辑</span></button>
       <div class="menu-divider"></div>
-      <button v-if="menuClip.kind === 'text'" class="menu-row" @click="openSendMenu(menuClip, $event)"><ClipIcon name="send" /><span class="menu-text">发送到设备</span><ClipIcon name="chevron" class="menu-chevron" /></button>
-      <button class="menu-row" @click="openMoveMenu(menuClip, $event)"><ClipIcon name="folder" /><span class="menu-text">移动到分组</span><ClipIcon name="chevron" class="menu-chevron" /></button>
+      <button v-if="menuClip.kind === 'text'" class="menu-row" :class="{ open: openSubmenu === 'send' }" data-submenu="send" aria-haspopup="menu" :aria-expanded="openSubmenu === 'send'" @click="showSubmenu('send', $event.currentTarget as HTMLElement, true)"><ClipIcon name="send" /><span class="menu-text">发送到设备</span><ClipIcon name="chevron" class="menu-chevron" /></button>
+      <button class="menu-row" :class="{ open: openSubmenu === 'move' }" data-submenu="move" aria-haspopup="menu" :aria-expanded="openSubmenu === 'move'" @click="showSubmenu('move', $event.currentTarget as HTMLElement, true)"><ClipIcon name="folder" /><span class="menu-text">移动到分组</span><ClipIcon name="chevron" class="menu-chevron" /></button>
       <div class="menu-divider"></div>
       <button class="menu-row" @click="menuAction('favorite')"><ClipIcon :name="menuClip.favorite ? 'star-fill' : 'star'" /><span class="menu-text">{{ menuClip.favorite ? '取消收藏' : '收藏' }}</span></button>
       <button class="menu-row" @click="menuAction('pin')"><ClipIcon name="pin" /><span class="menu-text">{{ menuClip.pinned ? '取消置顶' : '置顶' }}</span></button>
       <div class="menu-divider"></div>
       <button class="menu-row danger" @click="menuAction('delete')"><ClipIcon name="trash" /><span class="menu-text">删除条目</span></button>
     </div>
-    <div v-if="moveMenu.open" class="menu menu-surface move-menu" :style="{ left: moveMenu.x + 'px', top: moveMenu.y + 'px' }" @click.stop>
+    <div v-if="moveMenu.open" class="menu menu-surface move-menu" :style="{ left: moveMenu.x + 'px', top: moveMenu.y + 'px' }" @click.stop @mouseenter="keepSubmenu">
       <div class="menu-label">移动到</div>
       <div v-if="groups.length >= 7" class="menu-search"><ClipIcon name="search" /><input v-model="moveFilter" aria-label="搜索目标分组" placeholder="查找分组…" spellcheck="false" /></div>
       <div class="move-menu-scroll">
@@ -840,10 +974,12 @@ onUnmounted(() => {
         <div v-if="!groups.length" class="menu-label">先在分组菜单中新建分组</div>
         <div v-else-if="!visibleMoveGroups.length" class="menu-label">没有匹配的分组</div>
       </div>
-      <div class="menu-divider"></div>
-      <button class="menu-row" @click="moveTo(null)"><ClipIcon name="close" /><span class="menu-text">移出分组</span></button>
+      <template v-if="moveClip?.groupId != null">
+        <div class="menu-divider"></div>
+        <button class="menu-row" @click="moveTo(null)"><ClipIcon name="close" /><span class="menu-text">移出分组</span></button>
+      </template>
     </div>
-    <div v-if="sendMenu.open" class="menu menu-surface send-menu" :style="{ left: sendMenu.x + 'px', top: sendMenu.y + 'px' }" role="group" aria-label="发送到设备" tabindex="-1" @click.stop>
+    <div v-if="sendMenu.open" class="menu menu-surface send-menu" :style="{ left: sendMenu.x + 'px', top: sendMenu.y + 'px' }" role="group" aria-label="发送到设备" tabindex="-1" @click.stop @mouseenter="keepSubmenu">
       <div class="menu-label">发送文本到</div>
       <div v-if="sendLoading" class="send-menu-message" role="status">正在读取设备…</div>
       <template v-else>
@@ -853,7 +989,7 @@ onUnmounted(() => {
         <div v-if="sendError" class="send-menu-message send-menu-error" role="alert">{{ sendError }}</div>
         <template v-if="!lanPeers.length">
           <div class="menu-divider"></div>
-          <button v-if="sendLoadError" class="menu-row" @click="loadSendPeers(menuGeneration)"><ClipIcon name="refresh" /><span class="menu-text">重试读取</span></button>
+          <button v-if="sendLoadError" class="menu-row" @click="loadSendPeers(menuGeneration, true)"><ClipIcon name="refresh" /><span class="menu-text">重试读取</span></button>
           <button v-else class="menu-row" @click="openLanSettings"><ClipIcon name="plus" /><span class="menu-text">添加设备</span></button>
         </template>
       </template>
@@ -974,11 +1110,22 @@ onUnmounted(() => {
   .group-trigger { max-width: 96px; }
 }
 
+/* Rows slide under this header; once the list is scrolled it gets an edge so they don't
+   look cut off mid-air. */
+.search-area {
+  position: relative;
+  z-index: 2;
+  padding: 10px 10px 6px;
+  background: var(--surface);
+  transition: box-shadow 0.14s var(--ease);
+}
+.search-area.scrolled {
+  box-shadow: 0 1px 0 var(--border), 0 6px 10px -8px rgba(0, 0, 0, 0.2);
+}
 .search {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 10px 10px 6px;
   padding: 0 6px 0 10px;
   height: 36px;
   background: var(--surface-2);
@@ -1008,7 +1155,8 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin: 4px 10px;
+  width: 100%;
+  margin-top: 8px;
   padding: 6px 10px;
   border-radius: var(--r-sm);
   font-size: var(--fs-sm);
@@ -1065,6 +1213,10 @@ onUnmounted(() => {
   background: var(--surface-2);
   box-shadow: 0 1px 2px rgba(0, 0, 0, .025);
   cursor: default;
+  /* Up to 1000 rows: skip rendering the off-screen ones. 82px is the measured average row
+     height; `auto` keeps a row's real height once it has been shown. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 82px;
 }
 .item.selected {
   background: var(--selected);
@@ -1225,8 +1377,11 @@ onUnmounted(() => {
   overflow-y: auto;
 }
 .clip-menu .menu-row { min-height: 26px; padding: 3px 7px; }
+/* The row whose submenu is showing stays highlighted, as in native menus. */
+.clip-menu .menu-row.open { background: var(--accent-soft); color: var(--accent); }
+.clip-menu .menu-row.open > svg { color: var(--accent); }
 .clip-menu .menu-divider { margin: 2px 6px; }
-.move-menu { width: 224px; }
+.move-menu { width: 196px; } /* SUBMENU_WIDTH */
 .send-menu { width: 184px; }
 .send-menu-message { padding: 7px 9px; color: var(--muted); font-size: var(--fs-xs); line-height: 1.45; overflow-wrap: anywhere; }
 .send-menu-error { color: var(--danger); }
