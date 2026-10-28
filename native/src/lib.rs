@@ -3,8 +3,10 @@ mod clipboard;
 mod db;
 mod dib;
 mod images;
+mod instances;
 mod lan;
 mod settings;
+mod update;
 mod win;
 
 use base64::Engine as _;
@@ -18,7 +20,7 @@ use settings::{Settings, SettingsFile};
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock};
@@ -437,12 +439,59 @@ fn put_on_clipboard(core: &Core, id: i64) -> CmdResult<()> {
         .ok_or("条目不存在")?;
     if kind == db::KIND_IMAGE {
         let img = core.images.load(&content)?;
-        clipboard::write_image(&img).map_err(to_err)?;
+        let file = if core.settings().paste_image_as_file {
+            let source = db::source(&*core.conn()?, id).ok().flatten();
+            core.images
+                .png_bytes(&content)
+                .ok()
+                .map(|png| (png, paste_file_name(source.as_deref())))
+        } else {
+            None
+        };
+        clipboard::write_image(
+            &img,
+            file.as_ref()
+                .map(|(png, name)| (png.as_slice(), name.as_str())),
+        )
+        .map_err(to_err)?;
     } else {
         clipboard::write_text(&content).map_err(to_err)?;
     }
     db::touch(&*core.conn()?, id).map_err(to_err)?;
     Ok(())
+}
+
+/// File name offered for a pasted picture: the original name of a copied image file, otherwise
+/// the time of the paste, so consecutive pastes into an upload form don't clash.
+fn paste_file_name(source: Option<&str>) -> String {
+    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    let stem = source
+        .and_then(|s| Path::new(s).file_stem())
+        .map(|stem| {
+            stem.to_string_lossy()
+                .chars()
+                .filter(|c| !c.is_control() && !r#"<>:"/\|?*"#.contains(*c))
+                .take(80)
+                .collect::<String>()
+                .trim()
+                .trim_end_matches('.')
+                .to_owned()
+        })
+        .filter(|stem| {
+            let upper = stem.to_ascii_uppercase();
+            !stem.is_empty()
+                && !RESERVED.contains(&upper.as_str())
+                && !((upper.starts_with("COM") || upper.starts_with("LPT")) && upper.len() == 4)
+        });
+    let stem = stem.unwrap_or_else(|| {
+        let mut t = windows_sys::Win32::Foundation::SYSTEMTIME::default();
+        unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
+        format!(
+            "clipkeep_{:04}{:02}{:02}_{:02}{:02}{:02}",
+            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+        )
+    });
+    format!("{stem}.png")
 }
 
 #[tauri::command]
@@ -476,6 +525,48 @@ fn copy_clip(app: AppHandle, id: i64) {
 #[tauri::command]
 fn hide_window(app: AppHandle) {
     hide_main(&app);
+}
+
+/// Opens the download page in the user's browser. A link inside the WebView would navigate the
+/// app's own window away; going through Explorer also keeps the browser out of our elevation.
+#[tauri::command]
+fn open_release_page() -> CmdResult<()> {
+    Command::new("explorer.exe")
+        .arg(update::RELEASES_PAGE)
+        .spawn()
+        .map(drop)
+        .map_err(to_err)
+}
+
+#[tauri::command]
+fn get_update_state() -> update::State {
+    update::state()
+}
+
+#[tauri::command]
+async fn check_update(app: AppHandle) {
+    update::check(&app, false).await;
+}
+
+#[tauri::command]
+fn download_update(app: AppHandle) {
+    tauri::async_runtime::spawn(update::download(app));
+}
+
+#[tauri::command]
+fn cancel_update() {
+    update::cancel();
+}
+
+/// The installer closes clipkeep itself; exiting right away just makes that immediate.
+#[tauri::command]
+fn install_update(app: AppHandle) -> CmdResult<()> {
+    update::install()?;
+    if let Some(core) = app.try_state::<Core>() {
+        core.persist_position();
+    }
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -617,8 +708,9 @@ fn create_autostart_task() -> CmdResult<()> {
     Ok(())
 }
 
-/// Rewrites a task left by an older version with the current definition, as long as it still
-/// starts this executable; one pointing at another copy is left to that copy.
+/// Keeps the logon task current: rewrites one an older version of this exe created, and takes
+/// one over from an older copy elsewhere, e.g. the single-file build an installer upgrade left
+/// behind. A task for a newer copy is left alone.
 fn upgrade_autostart_task() {
     let Ok(output) = run_schtasks(&["/Query", "/TN", AUTOSTART_TASK, "/XML"]) else {
         return;
@@ -626,17 +718,31 @@ fn upgrade_autostart_task() {
     if !output.status.success() {
         return;
     }
-    let task = win::oem_to_string(&output.stdout).to_lowercase();
-    let Ok(executable) = std::env::current_exe() else {
+    let task = win::oem_to_string(&output.stdout);
+    let Some(target) = task_command(&task) else {
         return;
     };
-    let executable = xml_escape(&executable.display().to_string()).to_lowercase();
-    if task.contains(AUTOSTART_TASK_VERSION) || !task.contains(&executable) {
-        return;
-    }
-    if let Err(e) = create_autostart_task() {
+    let stale = if instances::is_current_exe(&target) {
+        !task.contains(AUTOSTART_TASK_VERSION)
+    } else {
+        instances::supersedes(&target)
+    };
+    if stale && let Err(e) = create_autostart_task() {
         eprintln!("upgrading autostart task failed: {e}");
     }
+}
+
+/// The program a scheduled task starts, from its XML definition.
+fn task_command(xml: &str) -> Option<PathBuf> {
+    let start = xml.find("<Command>")? + "<Command>".len();
+    let end = start + xml[start..].find("</Command>")?;
+    let command = xml[start..end]
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    Some(PathBuf::from(command.trim().trim_matches('"')))
 }
 
 fn delete_autostart_task() -> CmdResult<()> {
@@ -1148,7 +1254,34 @@ fn reveal_tray_menu(app: &AppHandle, window: &WebviewWindow) {
 
 #[cfg(test)]
 mod autostart_task_tests {
-    use super::{AUTOSTART_TASK_VERSION, autostart_task_xml};
+    use super::{AUTOSTART_TASK_VERSION, autostart_task_xml, paste_file_name, task_command};
+    use std::path::PathBuf;
+
+    #[test]
+    fn reads_the_command_of_old_and_new_tasks() {
+        let old = r#"<Exec><Command>"C:\Tools\clipkeep.exe"</Command><Arguments>--minimized</Arguments></Exec>"#;
+        assert_eq!(
+            task_command(old),
+            Some(PathBuf::from(r"C:\Tools\clipkeep.exe"))
+        );
+        let new = autostart_task_xml(r"C:\Users\张三\A&B\clipkeep.exe", r"PC\张三");
+        assert_eq!(
+            task_command(&new),
+            Some(PathBuf::from(r"C:\Users\张三\A&B\clipkeep.exe"))
+        );
+        assert_eq!(task_command("<Task/>"), None);
+    }
+
+    #[test]
+    fn names_pasted_pictures_after_their_file_or_the_time() {
+        assert_eq!(paste_file_name(Some("设计稿 v2.jpg")), "设计稿 v2.png");
+        assert_eq!(paste_file_name(Some(r"a<b>:c?.png")), "abc.png");
+        let timed = paste_file_name(None);
+        assert!(timed.starts_with("clipkeep_") && timed.ends_with(".png"));
+        assert_eq!(timed.len(), "clipkeep_20261028_120301.png".len());
+        assert!(paste_file_name(Some("CON.png")).starts_with("clipkeep_"));
+        assert!(paste_file_name(Some("...")).starts_with("clipkeep_"));
+    }
 
     #[test]
     fn task_runs_on_battery_without_time_limit_for_this_user() {
@@ -1235,6 +1368,14 @@ fn tray_menu_action(app: AppHandle, action: String) -> CmdResult<()> {
                 core.persist_position();
             }
             app.exit(0);
+        }
+        // A newer version is known: downloading and installing are confirmed in Settings.
+        "update" => {
+            hide_tray_menu_window(&app);
+            show_main(&app);
+            if let Some(w) = main_window(&app) {
+                let _ = w.emit("open-about", ());
+            }
         }
         _ => return Err("未知的托盘操作".into()),
     }
@@ -1484,6 +1625,10 @@ fn open_db(data_dir: &std::path::Path) -> CmdResult<Connection> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if !cfg!(debug_assertions) {
+        // Before the single-instance check, which would otherwise hand over to that copy.
+        instances::retire_older_instance();
+    }
     tauri::Builder::default()
         // With WebView2 focused, Tauri's default device filter can starve the host process's
         // WH_KEYBOARD_LL hook. Always keeps Win+V observable inside our own window too.
@@ -1542,6 +1687,13 @@ pub fn run() {
                 }
             }
             build_tray(&handle)?;
+            if !cfg!(debug_assertions) && settings.check_update_on_start {
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(update::STARTUP_DELAY);
+                    tauri::async_runtime::block_on(update::check(&h, true));
+                });
+            }
 
             let db = open_db(&data_dir).map_err(std::io::Error::other)?;
             let images = ImageStore::new(&data_dir)?;
@@ -1633,6 +1785,12 @@ pub fn run() {
             paste_clip,
             copy_clip,
             hide_window,
+            open_release_page,
+            get_update_state,
+            check_update,
+            download_update,
+            cancel_update,
+            install_update,
             hide_tray_menu,
             tray_menu_ready,
             tray_menu_action,

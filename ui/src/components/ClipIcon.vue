@@ -16,6 +16,7 @@ import {
   FolderPlus,
   HardDrive,
   Image as ImageIcon,
+  Info,
   Keyboard,
   Network,
   Pause,
@@ -70,6 +71,7 @@ const icons = {
   database: Database,
   download: Download,
   upload: Upload,
+  info: Info,
 } as const;
 
 defineProps<{ name: keyof typeof icons }>();

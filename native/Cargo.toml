@@ -1,6 +1,6 @@
 [package]
 name = "clipkeep"
-version = "0.2.0"
+version = "0.2.1"
 description = "clipkeep - clipboard history & favorites"
 authors = ["clipkeep contributors"]
 edition = "2024"
@@ -24,7 +24,7 @@ tauri-plugin-single-instance = "2.5.3"
 arboard = "3.6.1"
 clipboard-master = "4.0.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 blake3 = "1.5"
 tauri-plugin-dialog = "2.8.2"
@@ -32,6 +32,9 @@ base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 getrandom = "0.4.3"
 local-ip-address = "0.6.13"
+# Update check/download. Same reqwest as Tauri; Schannel TLS and the Windows proxy settings.
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "system-proxy"] }
+sha2 = "0.10.9"
 # Same versions Tauri uses; only for WebView2 interfaces it doesn't wrap.
 webview2-com = "0.39.1"
 windows-core = "0.62.2"

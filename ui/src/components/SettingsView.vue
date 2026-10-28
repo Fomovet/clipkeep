@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type LanState, type Settings, type SettingsView, type StorageUsage, type Theme } from "../api";
+import { formatSize, useUpdate } from "../update";
 import ClipIcon from "./ClipIcon.vue";
 
 defineEmits<{ back: [] }>();
@@ -31,6 +32,63 @@ const busy = ref(false);
 const clearOpen = ref(false);
 const clearFlags = reactive({ pinned: false, grouped: false, all: false });
 const clearArmed = ref(false);
+
+const { version: appVersion, state: update, newer } = useUpdate();
+const aboutEl = ref<HTMLElement | null>(null);
+const updateDesc = computed(() => {
+  const s = update.value;
+  switch (s.kind) {
+    case "checking": return "正在检查最新版本…";
+    case "upToDate": return "已是最新版";
+    case "available":
+      return s.portable
+        ? `发现新版本 v${s.version}。单文件版请下载后替换当前的 exe`
+        : `发现新版本 v${s.version}${s.size ? `（${formatSize(s.size)}）` : ""}，下载完成后由你确认安装`;
+    case "downloading": return `正在下载 v${s.version}`;
+    case "ready": return `v${s.version} 已下载并通过校验。安装时 clipkeep 会自动关闭，完成后重新启动，历史记录不受影响`;
+    case "error": return s.message;
+    default: return "同时查询 GitHub 和 jsDelivr，国内网络也能检查";
+  }
+});
+const updatePercent = computed(() => {
+  const s = update.value;
+  return s.kind === "downloading" && s.total > 0 ? Math.min(100, (s.received / s.total) * 100) : 0;
+});
+type UpdateAction = { label: string; icon: "refresh" | "download" | "close" | "upload"; run: () => unknown; accent?: boolean; busy?: boolean };
+const updateActions = computed<UpdateAction[]>(() => {
+  const s = update.value;
+  const check: UpdateAction = { label: "检查更新", icon: "refresh", run: api.checkUpdate };
+  const browser: UpdateAction = { label: "浏览器下载", icon: "download", run: api.openReleasePage };
+  switch (s.kind) {
+    case "checking": return [{ label: "检查中…", icon: "refresh", run: () => {}, busy: true }];
+    case "available":
+      return s.portable
+        ? [{ ...browser, label: "前往下载", accent: true }]
+        : [{ label: "下载并安装", icon: "download", run: api.downloadUpdate, accent: true }];
+    case "downloading": return [{ label: "取消", icon: "close", run: api.cancelUpdate }];
+    case "ready": return [{ label: "立即安装", icon: "upload", run: install, accent: true }];
+    case "error": return s.version ? [browser, { label: "重试", icon: "refresh", run: api.downloadUpdate }] : [{ ...check, label: "重试" }];
+    default: return [check];
+  }
+});
+
+async function install() {
+  try {
+    await api.installUpdate();
+  } catch (e) {
+    error.value = `安装失败：${e}`;
+  }
+}
+
+// Opened from the tray's "new version" row: bring this card into view once the page has loaded.
+const props = defineProps<{ focusAbout?: boolean }>();
+watch(
+  () => [props.focusAbout, aboutEl.value] as const,
+  ([focus, el]) => {
+    if (focus && el) nextTick(() => el.scrollIntoView({ block: "center" }));
+  },
+  { immediate: true },
+);
 let clearTimer: number | undefined;
 let noticeTimer: number | undefined;
 let storageTimer: number | undefined;
@@ -295,6 +353,13 @@ onUnmounted(() => {
           </div>
           <input type="checkbox" class="switch" :checked="s.captureImages" @change="save({ captureImages: !s.captureImages })" />
         </label>
+        <label class="row">
+          <div class="label">
+            <div class="name">粘贴图片时附带文件名</div>
+            <div class="desc">粘贴到网页上传时用原文件名或粘贴时间命名，避免多张图都叫 image.png。个别软件可能把图片当作文件发送，遇到时可关闭。</div>
+          </div>
+          <input type="checkbox" class="switch" :checked="s.pasteImageAsFile" @change="save({ pasteImageAsFile: !s.pasteImageAsFile })" />
+        </label>
       </div>
 
       <h3><ClipIcon name="storage" />存储</h3>
@@ -417,6 +482,44 @@ onUnmounted(() => {
         <div class="row">
           <div class="label"><div class="name">数据目录</div><div class="desc sel">{{ view.dataDir }}</div></div>
         </div>
+      </div>
+
+      <h3><ClipIcon name="info" />关于</h3>
+      <div ref="aboutEl" class="card">
+        <div class="row update-row">
+          <div class="label">
+            <div class="name">版本 {{ appVersion }}<span v-if="newer" class="update-dot" aria-label="有新版本"></span></div>
+            <div class="desc update-desc" :class="update.kind" aria-live="polite">{{ updateDesc }}</div>
+            <template v-if="update.kind === 'downloading'">
+              <div class="storage-track" role="progressbar" aria-label="下载进度" :aria-valuenow="Math.round(updatePercent)" aria-valuemin="0" aria-valuemax="100">
+                <div class="storage-fill" :style="{ width: `${updatePercent}%` }"></div>
+              </div>
+              <div class="storage-caption">
+                <span>{{ formatSize(update.received) }}{{ update.total ? ` / ${formatSize(update.total)}` : "" }}</span>
+                <span>{{ Math.floor(updatePercent) }}%</span>
+              </div>
+            </template>
+          </div>
+          <div class="update-actions">
+            <button
+              v-for="a in updateActions"
+              :key="a.label"
+              class="btn"
+              :class="{ accent: a.accent }"
+              :disabled="a.busy"
+              @click="a.run()"
+            >
+              <ClipIcon :name="a.icon" class="tiny" :class="{ spin: a.busy }" />{{ a.label }}
+            </button>
+          </div>
+        </div>
+        <label class="row">
+          <div class="label">
+            <div class="name">启动时检查更新</div>
+            <div class="desc">启动约 15 秒后检查一次。有新版本时托盘图标显示红点，不会自动下载或安装。</div>
+          </div>
+          <input type="checkbox" class="switch" :checked="s.checkUpdateOnStart" @change="save({ checkUpdateOnStart: !s.checkUpdateOnStart })" />
+        </label>
       </div>
 
       <h3 class="danger-heading"><ClipIcon name="trash" />清空记录</h3>
@@ -565,6 +668,19 @@ h3.danger-heading { color: var(--danger); }
   min-width: 0;
   border-radius: inherit;
   background: var(--accent);
+}
+.update-row { align-items: flex-start; }
+.update-row .label { flex: 1; min-width: 0; }
+.update-row .storage-track { margin-top: 8px; }
+.update-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.update-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 6px;
+  vertical-align: middle;
+  border-radius: 50%;
+  background: #e5484d;
 }
 .storage-caption {
   display: flex;
@@ -801,6 +917,19 @@ select:disabled {
   color: var(--muted);
   font-size: var(--fs-xs);
 }
+.update-desc.upToDate { color: var(--ok); }
+.update-desc.available { color: var(--accent); }
+.update-desc.error { color: var(--danger); }
+.btn.accent {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.btn.accent:hover:not(:disabled) { background: var(--accent-soft); filter: brightness(0.97); }
+.btn:disabled:has(.spin) { cursor: progress; }
+.spin { animation: settings-spin 0.9s linear infinite; }
+@keyframes settings-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
 
 .fade-enter-active,
 .fade-leave-active {

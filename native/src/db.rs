@@ -391,6 +391,15 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<(String, Strin
     .optional()
 }
 
+/// Where a clip came from; for a copied image file, its original file name.
+pub fn source(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT source FROM clips WHERE id = ?1", params![id], |r| {
+        r.get(0)
+    })
+    .optional()
+    .map(Option::flatten)
+}
+
 /// Edits a text row in place, preserving its ID, favorite, pin and group.
 pub fn edit_text(
     conn: &Connection,

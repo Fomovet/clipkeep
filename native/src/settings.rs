@@ -26,6 +26,10 @@ pub struct Settings {
     /// Auto-trim loose history over this many MB (0 = unlimited). Favorites/pinned/grouped excluded.
     pub max_storage_mb: u64,
     pub theme: Theme,
+    /// Look for a new release once, shortly after start-up. Never downloads by itself.
+    pub check_update_on_start: bool,
+    /// Also offer a pasted picture as a named file, so web uploads don't all get "image.png".
+    pub paste_image_as_file: bool,
 }
 
 impl Default for Settings {
@@ -40,6 +44,8 @@ impl Default for Settings {
             window_y: None,
             max_storage_mb: 500,
             theme: Theme::System,
+            check_update_on_start: true,
+            paste_image_as_file: true,
         }
     }
 }

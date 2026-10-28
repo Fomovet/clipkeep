@@ -5,8 +5,12 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, applyTheme, loadUi, saveUi, type Clip, type Group, type LanPeer, type Scope } from "./api";
 import SettingsView from "./components/SettingsView.vue";
 import ClipIcon from "./components/ClipIcon.vue";
+import { useUpdate } from "./update";
 
 const page = ref<"list" | "settings">("list");
+const { newer: newerVersion } = useUpdate();
+// Set when Settings is opened from the tray's "new version" row, to scroll to that card.
+const focusAbout = ref(false);
 const scope = ref<Scope>("all");
 const activeGroup = ref<number | null>(null);
 const query = ref("");
@@ -755,10 +759,12 @@ function itemHint(c: Clip, index: number) {
   ].filter(Boolean).join(" · ");
 }
 
-function openSettings() {
+function openSettings(about = false) {
+  focusAbout.value = about;
   page.value = "settings";
 }
 function backToList() {
+  focusAbout.value = false;
   page.value = "list";
   nextTick(() => searchEl.value?.focus());
 }
@@ -799,6 +805,8 @@ onMounted(async () => {
     await listen("groups-changed", reloadGroups),
     await listen("window-shown", onShown),
     await listen("window-hidden", onHidden),
+    // Arrives after window-shown, whose reset to the list page it then overrides.
+    await listen("open-about", () => openSettings(true)),
     await listen("settings-changed", syncSettings),
     await listen<boolean>("capture-paused-changed", (e) => (paused.value = e.payload)),
   );
@@ -827,7 +835,7 @@ onUnmounted(() => {
 
 <template>
   <div class="shell">
-    <SettingsView v-if="page === 'settings'" @back="backToList" />
+    <SettingsView v-if="page === 'settings'" :focus-about="focusAbout" @back="backToList" />
 
     <template v-else>
       <header class="topbar" @mousedown.self.left="startWindowDrag">
@@ -849,7 +857,9 @@ onUnmounted(() => {
           >
             <ClipIcon name="pin" />
           </button>
-          <button class="icon-btn" title="设置" @click="openSettings"><ClipIcon name="settings" /></button>
+          <button class="icon-btn settings-btn" :title="newerVersion ? `设置 · 有新版本 v${newerVersion}` : '设置'" @click="openSettings()">
+            <ClipIcon name="settings" /><span v-if="newerVersion" class="update-dot" aria-label="有新版本"></span>
+          </button>
           <button class="icon-btn" title="隐藏 (Esc)" @click="hideWindow"><ClipIcon name="close" /></button>
         </div>
       </header>
@@ -1103,6 +1113,18 @@ onUnmounted(() => {
 .actions {
   display: flex;
   gap: 1px;
+}
+.settings-btn { position: relative; }
+/* Same red as the dot painted on the tray icon. */
+.settings-btn .update-dot {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #e5484d;
+  box-shadow: 0 0 0 1.5px var(--surface-2);
 }
 @media (max-width: 370px) {
   .primary-tab { width: 30px; padding: 5px 7px; }
