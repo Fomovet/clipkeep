@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { api, applyTheme, loadUi, saveUi, type Clip, type Group, type LanPeer, type Scope } from "./api";
+import { api, applyTheme, loadUi, saveUi, type Clip, type ClipKind, type Group, type LanPeer, type Scope } from "./api";
 import SettingsView from "./components/SettingsView.vue";
 import ClipIcon from "./components/ClipIcon.vue";
 import { useUpdate } from "./update";
@@ -33,7 +33,23 @@ const groupFilter = ref("");
 const moveFilter = ref("");
 
 const groupInput = ref<HTMLInputElement | null>(null);
-const groupEditor = reactive({ open: false, mode: "create" as "create" | "rename", groupId: 0, name: "", error: "", busy: false, x: 0, y: 0 });
+const groupEditor = reactive({ open: false, mode: "create" as "create" | "edit", groupId: 0, name: "", autoTypes: [] as ClipKind[], includeExisting: false, error: "", busy: false, x: 0, y: 0 });
+const clipTypes: { kind: ClipKind; label: string; icon: "file-text" | "image" | "palette" }[] = [
+  { kind: "text", label: "文本", icon: "file-text" },
+  { kind: "image", label: "图片", icon: "image" },
+  { kind: "hex", label: "HEX", icon: "palette" },
+];
+const autoTypeConflicts = computed(() => clipTypes.flatMap(({ kind, label }) => {
+  if (!groupEditor.autoTypes.includes(kind)) return [];
+  const first = groups.value.find((g) => g.id === groupEditor.groupId || g.autoTypes.includes(kind));
+  return first && first.id !== groupEditor.groupId ? [`${label}将优先归入「${first.name}」`] : [];
+}));
+watch(() => groupEditor.autoTypes.length, (length) => {
+  if (!length) groupEditor.includeExisting = false;
+});
+watch(() => [groupEditor.error, autoTypeConflicts.value.join("；")], () => {
+  if (groupEditor.open) fitMenu(groupEditor, ".group-editor");
+});
 const groupMenu = reactive({ open: false, groupId: 0, confirming: false, x: 0, y: 0 });
 const moveMenu = reactive({ open: false, clipId: 0, x: 0, y: 0 });
 const sendMenu = reactive({ open: false, clipId: 0, x: 0, y: 0 });
@@ -263,11 +279,13 @@ async function togglePinnedWindow() {
   pinnedWindow.value = await api.toggleKeepOnBlur();
 }
 
-function showGroupEditor(mode: "create" | "rename", group: Group | null, x: number, y: number) {
+function showGroupEditor(mode: "create" | "edit", group: Group | null, x: number, y: number) {
   closeMenus();
   groupEditor.mode = mode;
   groupEditor.groupId = group?.id ?? 0;
   groupEditor.name = group?.name ?? "";
+  groupEditor.autoTypes = [...(group?.autoTypes ?? [])];
+  groupEditor.includeExisting = false;
   groupEditor.error = "";
   groupEditor.busy = false;
   groupEditor.open = true;
@@ -278,7 +296,7 @@ function showGroupEditor(mode: "create" | "rename", group: Group | null, x: numb
 function openNewGroup(e: MouseEvent) {
   e.stopPropagation();
   const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-  showGroupEditor("create", null, r.right - 228, r.bottom + 5);
+  showGroupEditor("create", null, r.right - 280, r.bottom + 5);
 }
 
 function openGroupPicker(e: MouseEvent) {
@@ -308,9 +326,9 @@ function cancelGroupEditor() {
   nextTick(() => searchEl.value?.focus());
 }
 
-function renameFromGroupMenu() {
+function editFromGroupMenu() {
   const group = menuGroup.value;
-  if (group) showGroupEditor("rename", group, groupMenu.x, groupMenu.y);
+  if (group) showGroupEditor("edit", group, groupMenu.x, groupMenu.y);
 }
 
 async function saveGroup() {
@@ -330,12 +348,13 @@ async function saveGroup() {
   groupEditor.error = "";
   try {
     if (groupEditor.mode === "create") {
-      const group = await api.createGroup(name);
+      const group = await api.createGroup(name, [...groupEditor.autoTypes], groupEditor.includeExisting);
       await reloadGroups();
       selectScope("group", group.id);
     } else {
-      await api.renameGroup(groupEditor.groupId, name);
+      await api.updateGroup(groupEditor.groupId, name, [...groupEditor.autoTypes], groupEditor.includeExisting);
       await reloadGroups();
+      await reload(true);
     }
     groupEditor.open = false;
   } catch (error) {
@@ -898,12 +917,16 @@ onUnmounted(() => {
               <span class="image-name" :title="c.source || '剪贴板图片'">{{ c.source || '剪贴板图片' }}</span>
               <span v-if="c.width && c.height" class="image-dimensions">{{ c.width }} × {{ c.height }}</span>
             </div>
+            <div v-else-if="c.contentType === 'hex'" class="hex-preview">
+              <span class="hex-swatch" aria-hidden="true"><span :style="{ backgroundColor: c.preview }"></span></span>
+              <span class="hex-value">{{ c.preview }}</span>
+            </div>
             <div v-else class="text">{{ c.preview }}<span v-if="c.truncated" class="more">…</span></div>
             <div class="item-footer">
               <div class="meta">
                 <span class="meta-time">{{ timeAgo(c.updatedAt) }}</span>
                 <span class="meta-dot" aria-hidden="true">·</span>
-                <span class="meta-type"><ClipIcon :name="c.kind === 'image' ? 'image' : 'file-text'" class="tiny" />{{ c.kind === 'image' ? '图片' : '文本' }}</span>
+                <span class="meta-type"><ClipIcon :name="c.contentType === 'hex' ? 'palette' : c.kind === 'image' ? 'image' : 'file-text'" class="tiny" />{{ c.contentType === 'hex' ? 'HEX 色值' : c.kind === 'image' ? '图片' : '文本' }}</span>
                 <span v-if="c.pinned" class="meta-flag pin-flag"><ClipIcon name="pin" class="tiny" />置顶</span>
                 <span v-if="scope !== 'group' && groupName(c.groupId)" class="meta-flag group-flag" :title="groupName(c.groupId) ?? ''"><ClipIcon name="folder" class="tiny" /><span class="group-label">{{ groupName(c.groupId) }}</span></span>
               </div>
@@ -1007,7 +1030,7 @@ onUnmounted(() => {
     <div v-if="groupMenu.open && menuGroup" class="menu menu-surface group-menu" :style="{ left: groupMenu.x + 'px', top: groupMenu.y + 'px' }" @click.stop>
       <div class="menu-label group-menu-title" :title="menuGroup.name">{{ menuGroup.name }}</div>
       <template v-if="!groupMenu.confirming">
-        <button class="menu-row" @click="renameFromGroupMenu"><ClipIcon name="edit" /><span class="menu-text">重命名</span></button>
+        <button class="menu-row" @click="editFromGroupMenu"><ClipIcon name="edit" /><span class="menu-text">编辑分组</span></button>
         <div class="menu-divider"></div>
         <button class="menu-row danger" @click="requestDeleteGroup"><ClipIcon name="trash" /><span class="menu-text">删除分组</span></button>
       </template>
@@ -1020,12 +1043,29 @@ onUnmounted(() => {
       </div>
     </div>
     <form v-if="groupEditor.open" class="menu menu-surface group-editor" :style="{ left: groupEditor.x + 'px', top: groupEditor.y + 'px' }" @click.stop @submit.prevent="saveGroup">
-      <label class="group-editor-label" for="group-name-input">{{ groupEditor.mode === 'create' ? '新建分组' : '重命名分组' }}</label>
-      <input id="group-name-input" ref="groupInput" v-model="groupEditor.name" class="group-editor-input" placeholder="输入分组名称" maxlength="60" autocomplete="off" spellcheck="false" :aria-invalid="Boolean(groupEditor.error)" :aria-describedby="groupEditor.error ? 'group-editor-error' : undefined" @input="groupEditor.error = ''" />
+      <label class="group-editor-label" for="group-name-input">{{ groupEditor.mode === 'create' ? '新建分组' : '编辑分组' }}</label>
+      <input id="group-name-input" ref="groupInput" v-model="groupEditor.name" class="group-editor-input" placeholder="输入分组名称" maxlength="60" autocomplete="off" spellcheck="false" :disabled="groupEditor.busy" :aria-invalid="Boolean(groupEditor.error)" :aria-describedby="groupEditor.error ? 'group-editor-error' : undefined" @input="groupEditor.error = ''" />
       <p v-if="groupEditor.error" id="group-editor-error" class="group-editor-error" role="alert">{{ groupEditor.error }}</p>
+      <fieldset class="group-auto-types" :disabled="groupEditor.busy" aria-describedby="group-auto-help">
+        <legend>自动引入类型 <span>可多选</span></legend>
+        <div class="group-type-options">
+          <label v-for="type in clipTypes" :key="type.kind" class="group-type-option" :class="{ selected: groupEditor.autoTypes.includes(type.kind) }">
+            <input v-model="groupEditor.autoTypes" type="checkbox" :value="type.kind" :aria-label="type.kind === 'hex' ? 'HEX 色值' : undefined" />
+            <ClipIcon :name="type.icon" /><span>{{ type.label }}</span>
+          </label>
+        </div>
+        <p id="group-auto-help" class="group-auto-help">按选中类型自动归组；不选则手动整理。</p>
+        <p class="group-auto-help">HEX 独立分类，支持 3/4/6/8 位色值。</p>
+        <label class="group-existing-option">
+          <input v-model="groupEditor.includeExisting" type="checkbox" :disabled="!groupEditor.autoTypes.length" />
+          <span>同时归入已有未分组记录</span>
+        </label>
+        <p class="group-auto-help">多组匹配时，按分组顺序归入；拖动可调整优先级。</p>
+        <p v-if="autoTypeConflicts.length" class="group-auto-conflict" role="status">{{ autoTypeConflicts.join('；') }}。</p>
+      </fieldset>
       <div class="group-editor-actions">
         <button type="button" class="group-cancel" :disabled="groupEditor.busy" @click="cancelGroupEditor">取消</button>
-        <button type="submit" class="group-submit" :disabled="groupEditor.busy">{{ groupEditor.mode === 'create' ? '创建' : '保存' }}</button>
+        <button type="submit" class="group-submit" :disabled="groupEditor.busy">{{ groupEditor.busy ? '保存中…' : groupEditor.mode === 'create' ? '创建' : '保存' }}</button>
       </div>
     </form>
 
@@ -1450,7 +1490,7 @@ onUnmounted(() => {
 .group-submit:hover { background: var(--selected); }
 .group-delete-confirm { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
 .group-delete-confirm:hover { filter: brightness(.95); }
-.group-editor { width: 228px; padding: 11px; }
+.group-editor { width: 280px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow-y: auto; padding: 11px; }
 .group-editor-label { display: block; margin-bottom: 8px; color: var(--text); font-size: var(--fs-sm); font-weight: 600; }
 .group-editor-input {
   display: block;
@@ -1464,8 +1504,27 @@ onUnmounted(() => {
   color: var(--text);
 }
 .group-editor-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
-.group-editor-error { margin: 6px 0 0; color: var(--danger); font-size: var(--fs-xs); }
-.group-editor-actions { margin-top: 10px; }
+.group-editor-error { margin: 6px 0 0; color: color-mix(in srgb, var(--danger) 80%, var(--text)); font-size: var(--fs-xs); }
+.group-editor-actions { position: sticky; bottom: -11px; z-index: 1; margin: 10px -11px -11px; padding: 10px 11px; background: var(--elevated); border-top: 1px solid var(--border); }
+.group-auto-types { min-width: 0; margin: 14px 0 0; padding: 0; border: 0; }
+.group-auto-types legend { width: 100%; padding: 0; color: var(--text); font-size: var(--fs-sm); font-weight: 600; }
+.group-auto-types legend span { margin-left: 4px; color: var(--muted); font-weight: 400; }
+.group-type-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-top: 8px; }
+.group-type-option { display: flex; align-items: center; gap: 5px; min-height: 36px; padding: 7px 6px; border: 1px solid var(--border-strong); border-radius: var(--r-sm); color: var(--text-2); cursor: pointer; }
+.group-type-option:hover { background: var(--hover); }
+.group-type-option.selected { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.group-type-option svg { width: 14px; height: 14px; }
+.group-auto-types input { width: 14px; height: 14px; margin: 0; flex: none; accent-color: var(--accent); }
+.group-auto-types input:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.group-auto-types:disabled { opacity: .65; }
+.group-auto-help, .group-auto-conflict { margin: 8px 0 0; color: var(--muted); font-size: var(--fs-sm); line-height: 1.5; overflow-wrap: anywhere; }
+.group-existing-option { display: flex; align-items: center; gap: 7px; min-height: 32px; margin-top: 5px; color: var(--text-2); font-size: var(--fs-sm); cursor: pointer; }
+.group-existing-option:has(input:disabled) { opacity: .65; cursor: default; }
+.group-auto-conflict { color: var(--text-2); }
+.hex-preview { display: flex; align-items: center; gap: 10px; min-height: 44px; }
+.hex-swatch { display: block; width: 40px; height: 40px; flex: none; overflow: hidden; border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--surface); }
+.hex-swatch > span { display: block; width: 100%; height: 100%; }
+.hex-value { font-family: ui-monospace, Consolas, monospace; color: var(--text); font-size: var(--fs-lg); }
 .preview-panel {
   position: absolute;
   inset: 0;

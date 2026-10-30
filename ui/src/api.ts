@@ -1,9 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 
+export type ClipKind = "text" | "image" | "hex";
+
 export interface Clip {
   id: number;
   kind: "text" | "image";
+  contentType: ClipKind;
   preview: string;
   size: number;
   truncated: boolean;
@@ -21,6 +24,7 @@ export interface Group {
   id: number;
   name: string;
   sortOrder: number;
+  autoTypes: ClipKind[];
 }
 
 export interface Settings {
@@ -85,7 +89,10 @@ export const api = {
   clearData: (includePinned: boolean, includeGrouped: boolean, includeAll: boolean) =>
     invoke<void>("clear_data", { includePinned, includeGrouped, includeAll }),
   listGroups: () => invoke<Group[]>("list_groups"),
-  createGroup: (name: string) => invoke<Group>("create_group", { name }),
+  createGroup: (name: string, autoTypes: ClipKind[], includeExisting: boolean) =>
+    invoke<Group>("create_group", { name, autoTypes, includeExisting }),
+  updateGroup: (id: number, name: string, autoTypes: ClipKind[], includeExisting: boolean) =>
+    invoke<void>("update_group", { id, name, autoTypes, includeExisting }),
   renameGroup: (id: number, name: string) => invoke<void>("rename_group", { id, name }),
   deleteGroup: (id: number, deleteItems: boolean) => invoke<void>("delete_group", { id, deleteItems }),
   reorderGroups: (ids: number[]) => invoke<void>("reorder_groups", { ids }),
