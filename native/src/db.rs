@@ -1,12 +1,12 @@
 use blake3::Hasher;
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PREVIEW_CHARS: usize = 400;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const LIST_LIMIT: i64 = 1000;
 
 /// Favorites, pinned, and grouped items are kept forever and don't count toward the size budget;
@@ -18,11 +18,43 @@ const ORDER: &str = "ORDER BY pinned DESC, pinned_at DESC, updated_at DESC";
 pub const KIND_TEXT: &str = "text";
 pub const KIND_IMAGE: &str = "image";
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipKind {
+    Text,
+    Image,
+    Hex,
+}
+
+impl ClipKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => KIND_TEXT,
+            Self::Image => KIND_IMAGE,
+            Self::Hex => "hex",
+        }
+    }
+
+    fn classify(kind: &str, content: &str) -> Self {
+        if kind == KIND_IMAGE {
+            return Self::Image;
+        }
+        if let Some(hex) = content.trim().strip_prefix('#')
+            && matches!(hex.len(), 3 | 4 | 6 | 8)
+            && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Self::Hex;
+        }
+        Self::Text
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Clip {
     pub id: i64,
     pub kind: String,
+    pub content_type: String,
     pub preview: String,
     /// Stored size in bytes (text UTF-8 length, or PNG file size).
     pub size: i64,
@@ -46,6 +78,7 @@ pub struct Group {
     pub id: i64,
     pub name: String,
     pub sort_order: i64,
+    pub auto_types: Vec<ClipKind>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -134,6 +167,7 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             0 => migrate_v1(&tx)?,
             1 => migrate_v2(&tx)?,
             2 => migrate_v3(&tx)?,
+            3 => migrate_v4(&tx)?,
             _ => unreachable!(),
         }
         version += 1;
@@ -214,6 +248,35 @@ fn migrate_v3(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
     ))
 }
 
+fn migrate_v4(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE group_auto_types (
+             group_id INTEGER NOT NULL,
+             kind TEXT NOT NULL CHECK (kind IN ('text', 'image', 'hex')),
+             PRIMARY KEY (group_id, kind)
+         );
+         CREATE INDEX idx_group_auto_types_kind ON group_auto_types(kind, group_id);
+         ALTER TABLE clips ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text';
+         UPDATE clips SET content_type = 'image' WHERE kind = 'image';",
+    )?;
+    // Classify existing text once on upgrade, retaining physical text storage and paste behavior.
+    let hex_ids = {
+        let mut stmt = tx.prepare("SELECT id, content FROM clips WHERE kind = 'text'")?;
+        let mut ids: Vec<i64> = Vec::new();
+        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, content) = row?;
+            if ClipKind::classify(KIND_TEXT, &content) == ClipKind::Hex {
+                ids.push(id);
+            }
+        }
+        ids
+    };
+    for id in hex_ids {
+        tx.execute("UPDATE clips SET content_type = 'hex' WHERE id = ?1", [id])?;
+    }
+    Ok(())
+}
+
 pub fn referenced_files(conn: &Connection) -> rusqlite::Result<HashSet<String>> {
     let mut stmt = conn.prepare("SELECT content FROM clips WHERE kind = 'image'")?;
     stmt.query_map([], |r| r.get(0))?.collect()
@@ -231,9 +294,12 @@ pub fn is_file_referenced(conn: &Connection, file: &str) -> rusqlite::Result<boo
 /// (0 = unlimited). Returns image file names of any rows removed.
 pub fn upsert(conn: &Connection, clip: &NewClip, max_bytes: i64) -> rusqlite::Result<Vec<String>> {
     conn.execute(
-        "INSERT INTO clips (kind, content, preview, hash, width, height, size, source, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
-         ON CONFLICT(hash) DO UPDATE SET updated_at = excluded.updated_at, use_count = use_count + 1",
+        "INSERT INTO clips (kind, content, preview, hash, width, height, size, source, created_at, updated_at, content_type, group_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10,
+             (SELECT g.id FROM clipboard_groups g JOIN group_auto_types a ON a.group_id = g.id
+              WHERE a.kind = ?10 ORDER BY g.sort_order, g.id LIMIT 1))
+         ON CONFLICT(hash) DO UPDATE SET updated_at = excluded.updated_at, use_count = use_count + 1,
+             group_id = COALESCE(clips.group_id, excluded.group_id)",
         params![
             clip.kind,
             clip.content,
@@ -243,7 +309,8 @@ pub fn upsert(conn: &Connection, clip: &NewClip, max_bytes: i64) -> rusqlite::Re
             clip.height,
             clip.size,
             clip.source,
-            now_ms()
+            now_ms(),
+            ClipKind::classify(clip.kind, clip.content).as_str()
         ],
     )?;
     enforce_storage(conn, max_bytes)
@@ -337,8 +404,8 @@ pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Ve
         format!("WHERE {}", filters.join(" AND "))
     };
     let sql = format!(
-        "SELECT id, kind, CASE WHEN kind = 'image' THEN content ELSE COALESCE(preview, '') END,
-                size, length(CAST(preview AS BLOB)) < size, width, height, favorite, pinned, updated_at, source, group_id
+        "SELECT id, kind, CASE WHEN kind = 'image' OR content_type = 'hex' THEN content ELSE COALESCE(preview, '') END,
+                size, length(CAST(preview AS BLOB)) < size, width, height, favorite, pinned, updated_at, source, group_id, content_type
          FROM clips {where_clause} {ORDER} LIMIT {LIST_LIMIT}"
     );
     let pattern = format!(
@@ -353,17 +420,22 @@ pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Ve
         let kind: String = r.get(1)?;
         let body: String = r.get(2)?;
         let is_image = kind == KIND_IMAGE;
+        let content_type: String = r.get(12)?;
+        let is_hex = content_type == "hex";
         Ok(Clip {
             id: r.get(0)?,
             preview: if is_image {
                 String::new()
+            } else if is_hex {
+                body.trim().to_string()
             } else {
                 body.clone()
             },
             file: is_image.then_some(body),
             kind,
+            content_type,
             size: r.get(3)?,
-            truncated: !is_image && r.get::<_, Option<bool>>(4)?.unwrap_or(false),
+            truncated: !is_image && !is_hex && r.get::<_, Option<bool>>(4)?.unwrap_or(false),
             width: r.get(5)?,
             height: r.get(6)?,
             favorite: r.get::<_, i64>(7)? != 0,
@@ -437,8 +509,8 @@ pub fn edit_text(
         return Err("相同文本已存在于历史记录".into());
     }
     conn.execute(
-        "UPDATE clips SET content = ?2, preview = ?3, hash = ?4, size = ?5, updated_at = ?6 WHERE id = ?1",
-        params![id, text, preview_of(KIND_TEXT, text), hash, text.len() as i64, now_ms()],
+        "UPDATE clips SET content = ?2, preview = ?3, hash = ?4, size = ?5, updated_at = ?6, content_type = ?7 WHERE id = ?1",
+        params![id, text, preview_of(KIND_TEXT, text), hash, text.len() as i64, now_ms(), ClipKind::classify(KIND_TEXT, text).as_str()],
     )
     .map_err(|e| e.to_string())?;
     enforce_storage(conn, max_bytes).map_err(|e| e.to_string())
@@ -515,12 +587,31 @@ pub fn list_groups(conn: &Connection) -> rusqlite::Result<Vec<Group>> {
             id: r.get(0)?,
             name: r.get(1)?,
             sort_order: r.get(2)?,
+            auto_types: group_auto_types(conn, r.get(0)?)?,
         })
     })?
     .collect()
 }
 
-pub fn create_group(conn: &Connection, name: &str) -> rusqlite::Result<Group> {
+fn group_auto_types(conn: &Connection, id: i64) -> rusqlite::Result<Vec<ClipKind>> {
+    let mut stmt =
+        conn.prepare("SELECT kind FROM group_auto_types WHERE group_id = ?1 ORDER BY kind DESC")?;
+    stmt.query_map([id], |r| match r.get::<_, String>(0)?.as_str() {
+        KIND_TEXT => Ok(ClipKind::Text),
+        KIND_IMAGE => Ok(ClipKind::Image),
+        "hex" => Ok(ClipKind::Hex),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    })?
+    .collect()
+}
+
+/// The caller wraps group metadata, rules and optional backfill in one transaction.
+pub fn create_group(
+    conn: &Connection,
+    name: &str,
+    auto_types: &[ClipKind],
+    include_existing: bool,
+) -> rusqlite::Result<Group> {
     let next: i64 = conn.query_row(
         "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM clipboard_groups",
         [],
@@ -530,11 +621,58 @@ pub fn create_group(conn: &Connection, name: &str) -> rusqlite::Result<Group> {
         "INSERT INTO clipboard_groups (name, sort_order, created_at) VALUES (?1, ?2, ?3)",
         params![name, next, now_ms()],
     )?;
+    let id = conn.last_insert_rowid();
+    set_group_auto_types(conn, id, auto_types, include_existing)?;
     Ok(Group {
-        id: conn.last_insert_rowid(),
+        id,
         name: name.to_string(),
         sort_order: next,
+        auto_types: group_auto_types(conn, id)?,
     })
+}
+
+fn set_group_auto_types(
+    conn: &Connection,
+    id: i64,
+    auto_types: &[ClipKind],
+    include_existing: bool,
+) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM group_auto_types WHERE group_id = ?1", [id])?;
+    for kind in auto_types {
+        conn.execute(
+            "INSERT OR IGNORE INTO group_auto_types (group_id, kind) VALUES (?1, ?2)",
+            params![id, kind.as_str()],
+        )?;
+    }
+    if include_existing {
+        // Backfill only loose records, using the same priority as live capture.
+        conn.execute(
+            "UPDATE clips SET group_id = (
+                 SELECT g.id FROM clipboard_groups g JOIN group_auto_types a ON a.group_id = g.id
+                 WHERE a.kind = clips.content_type ORDER BY g.sort_order, g.id LIMIT 1
+             ) WHERE group_id IS NULL
+               AND content_type IN (SELECT kind FROM group_auto_types WHERE group_id = ?1)",
+            [id],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn update_group(
+    conn: &Connection,
+    id: i64,
+    name: &str,
+    auto_types: &[ClipKind],
+    include_existing: bool,
+) -> rusqlite::Result<()> {
+    if conn.execute(
+        "UPDATE clipboard_groups SET name = ?2 WHERE id = ?1",
+        params![id, name],
+    )? == 0
+    {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    set_group_auto_types(conn, id, auto_types, include_existing)
 }
 
 pub fn rename_group(conn: &Connection, id: i64, name: &str) -> rusqlite::Result<()> {
@@ -560,6 +698,7 @@ pub fn delete_group(
         )?;
         Vec::new()
     };
+    conn.execute("DELETE FROM group_auto_types WHERE group_id = ?1", [id])?;
     conn.execute("DELETE FROM clipboard_groups WHERE id = ?1", params![id])?;
     Ok(files)
 }
@@ -611,8 +750,8 @@ pub fn import_clip(conn: &Connection, c: &RawClip) -> rusqlite::Result<()> {
     let fav_at = c.favorite.then_some(stamp);
     let pinned_at = c.pinned.then_some(stamp);
     conn.execute(
-        "INSERT INTO clips (kind, content, preview, hash, width, height, size, favorite, fav_at, pinned, pinned_at, group_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "INSERT INTO clips (kind, content, preview, hash, width, height, size, favorite, fav_at, pinned, pinned_at, group_id, created_at, updated_at, content_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(hash) DO UPDATE SET
              favorite = MAX(favorite, excluded.favorite),
              fav_at = COALESCE(fav_at, excluded.fav_at),
@@ -622,7 +761,8 @@ pub fn import_clip(conn: &Connection, c: &RawClip) -> rusqlite::Result<()> {
              updated_at = MAX(updated_at, excluded.updated_at)",
         params![
             c.kind, c.content, preview_of(&c.kind, &c.content), c.hash, c.width, c.height, c.size,
-            c.favorite as i64, fav_at, c.pinned as i64, pinned_at, c.group_id, c.created_at, c.updated_at
+            c.favorite as i64, fav_at, c.pinned as i64, pinned_at, c.group_id, c.created_at, c.updated_at,
+            ClipKind::classify(&c.kind, &c.content).as_str()
         ],
     )?;
     Ok(())
@@ -679,6 +819,355 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect()
+    }
+
+    fn add_image(conn: &Connection, file: &str, max_bytes: i64) -> i64 {
+        upsert(
+            conn,
+            &NewClip {
+                kind: KIND_IMAGE,
+                content: file,
+                hash: file,
+                width: Some(100),
+                height: Some(50),
+                size: 500,
+                source: None,
+            },
+            max_bytes,
+        )
+        .unwrap();
+        conn.query_row("SELECT id FROM clips WHERE hash = ?1", [file], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn assigned_group(conn: &Connection, id: i64) -> Option<i64> {
+        conn.query_row("SELECT group_id FROM clips WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn hex_classification_requires_one_complete_prefixed_css_color() {
+        for color in [
+            "#fff",
+            "#AbCd",
+            "#2563eb",
+            "#AaBbCcDD",
+            " \t#123456\r\n",
+            "\u{3000}#123\u{3000}",
+        ] {
+            assert_eq!(
+                ClipKind::classify(KIND_TEXT, color),
+                ClipKind::Hex,
+                "{color:?}"
+            );
+        }
+        for text in [
+            "",
+            "#",
+            "#12",
+            "#12345",
+            "#1234567",
+            "#123456789",
+            "#12x",
+            "#ＦＦＦ",
+            "FFFFFF",
+            "0xFFFFFF",
+            "color: #fff",
+            "#fff #000",
+            "#fff\n#000",
+            "https://example.com/#fff",
+            "#12 3",
+        ] {
+            assert_eq!(
+                ClipKind::classify(KIND_TEXT, text),
+                ClipKind::Text,
+                "{text:?}"
+            );
+        }
+        assert_eq!(ClipKind::classify(KIND_IMAGE, "#fff"), ClipKind::Image);
+    }
+
+    #[test]
+    fn hex_is_a_separate_auto_type_and_keeps_original_text_for_copying() {
+        let conn = mem();
+        let text_group = create_group(&conn, "文字优先", &[ClipKind::Text], false).unwrap();
+        let hex_group = create_group(&conn, "色板", &[ClipKind::Hex], false).unwrap();
+        let original = " \t#AaBbCcDD\r\n";
+        let id = add(&conn, original, original.len() as i64);
+        assert_eq!(assigned_group(&conn, id), Some(hex_group.id));
+        let color = list(&conn, Scope::Group(hex_group.id), "")
+            .unwrap()
+            .remove(0);
+        assert_eq!(color.content_type, "hex");
+        assert_eq!(color.kind, KIND_TEXT);
+        assert_eq!(color.preview, "#AaBbCcDD");
+        assert!(!color.truncated);
+        assert_eq!(get(&conn, id).unwrap().unwrap().1, original);
+        assert_eq!(add(&conn, original, original.len() as i64), id);
+        let prose = add(&conn, "背景色是 #fff", 17);
+        assert_eq!(assigned_group(&conn, prose), Some(text_group.id));
+        assert_eq!(
+            list(&conn, Scope::Group(text_group.id), "").unwrap()[0].content_type,
+            "text"
+        );
+    }
+
+    #[test]
+    fn hex_backfill_and_edits_update_classification_without_moving_existing_groups() {
+        let conn = mem();
+        let hex = add(&conn, "#f0a8", 5);
+        let text = add(&conn, "普通文本", 12);
+        let image = add_image(&conn, "hex-backfill.png", 0);
+        let group = create_group(&conn, "HEX", &[ClipKind::Hex], true).unwrap();
+        assert_eq!(assigned_group(&conn, hex), Some(group.id));
+        assert_eq!(assigned_group(&conn, text), None);
+        assert_eq!(assigned_group(&conn, image), None);
+        edit_text(&conn, hex, "现在是文本", 0).unwrap();
+        let row = list(&conn, Scope::Group(group.id), "").unwrap().remove(0);
+        assert_eq!(row.content_type, "text");
+        assert_eq!(row.group_id, Some(group.id));
+        edit_text(&conn, text, "#123ABC", 0).unwrap();
+        let row = list(&conn, Scope::All, "123ABC").unwrap().remove(0);
+        assert_eq!(row.content_type, "hex");
+        assert_eq!(row.group_id, None);
+    }
+
+    #[test]
+    fn imported_hex_text_is_classified_and_remains_editable_text() {
+        let conn = mem();
+        let content = "#12345678";
+        import_clip(
+            &conn,
+            &RawClip {
+                kind: KIND_TEXT.into(),
+                content: content.into(),
+                hash: text_hash(content),
+                width: None,
+                height: None,
+                size: content.len() as i64,
+                favorite: false,
+                pinned: false,
+                group_id: None,
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .unwrap();
+        let row = list(&conn, Scope::All, "").unwrap().remove(0);
+        assert_eq!(row.content_type, "hex");
+        assert_eq!(row.kind, KIND_TEXT);
+        edit_text(&conn, row.id, "#abc", 0).unwrap();
+        assert_eq!(get(&conn, row.id).unwrap().unwrap().1, "#abc");
+    }
+
+    #[test]
+    fn v3_migration_preserves_groups_and_starts_without_rules() {
+        let mut conn = mem();
+        let group = create_group(&conn, "旧分组", &[], false).unwrap();
+        let id = add(&conn, "旧记录", 9);
+        let hex = add(&conn, "\u{3000}#AABBCC\u{3000}", 13);
+        set_group(&conn, id, Some(group.id)).unwrap();
+        conn.execute_batch("DROP TABLE group_auto_types; ALTER TABLE clips DROP COLUMN content_type; PRAGMA user_version = 3;")
+            .unwrap();
+        migrate(&mut conn).unwrap();
+        let groups = list_groups(&conn).unwrap();
+        assert_eq!(groups[0].name, "旧分组");
+        assert!(groups[0].auto_types.is_empty());
+        assert_eq!(assigned_group(&conn, id), Some(group.id));
+        let color = list(&conn, Scope::All, "AABBCC").unwrap().remove(0);
+        assert_eq!(color.id, hex);
+        assert_eq!(color.content_type, "hex");
+        assert_eq!(color.preview, "#AABBCC");
+        assert_eq!(assigned_group(&conn, add(&conn, "新记录", 9)), None);
+    }
+
+    #[test]
+    fn automatically_groups_both_types_and_protects_them_from_trimming() {
+        let conn = mem();
+        let manual = create_group(&conn, "手动", &[], false).unwrap();
+        let text = create_group(&conn, "文字", &[ClipKind::Text], false).unwrap();
+        let image = create_group(&conn, "图片", &[ClipKind::Image], false).unwrap();
+        let text_id = add(&conn, "自动分类", 12);
+        let image_id = add_image(&conn, "auto.png", 1);
+        assert_eq!(assigned_group(&conn, text_id), Some(text.id));
+        assert_eq!(assigned_group(&conn, image_id), Some(image.id));
+        assert!(list(&conn, Scope::Group(manual.id), "").unwrap().is_empty());
+        assert_eq!(list(&conn, Scope::Group(image.id), "").unwrap().len(), 1);
+        assert!(enforce_storage(&conn, 1).unwrap().is_empty());
+        assert_eq!(list(&conn, Scope::All, "").unwrap().len(), 2);
+        let groups = list_groups(&conn).unwrap();
+        assert_eq!(groups[1].auto_types, [ClipKind::Text]);
+        assert_eq!(groups[2].auto_types, [ClipKind::Image]);
+    }
+
+    #[test]
+    fn multi_type_rule_uses_order_and_reordering_only_affects_future_captures() {
+        let conn = mem();
+        let first = create_group(&conn, "第一", &[ClipKind::Text, ClipKind::Image], false).unwrap();
+        let second = create_group(&conn, "第二", &[ClipKind::Text], false).unwrap();
+        let before = add(&conn, "排序之前", 12);
+        assert_eq!(assigned_group(&conn, before), Some(first.id));
+        assert_eq!(
+            assigned_group(&conn, add_image(&conn, "first.png", 0)),
+            Some(first.id)
+        );
+        reorder_groups(&conn, &[second.id, first.id]).unwrap();
+        let after = add(&conn, "排序之后", 12);
+        assert_eq!(assigned_group(&conn, after), Some(second.id));
+        add(&conn, "排序之前", 12);
+        assert_eq!(assigned_group(&conn, before), Some(first.id));
+        assert_eq!(
+            assigned_group(&conn, add_image(&conn, "second.png", 0)),
+            Some(first.id)
+        );
+    }
+
+    #[test]
+    fn recopy_classifies_loose_history_but_preserves_manual_group_and_flags() {
+        let conn = mem();
+        let loose = add(&conn, "历史文本", 12);
+        let manual = create_group(&conn, "手动", &[], false).unwrap();
+        let grouped = add(&conn, "手动文本", 12);
+        set_group(&conn, grouped, Some(manual.id)).unwrap();
+        toggle_favorite(&conn, grouped).unwrap();
+        toggle_pinned(&conn, grouped).unwrap();
+        let auto = create_group(&conn, "自动", &[ClipKind::Text], false).unwrap();
+        assert_eq!(assigned_group(&conn, loose), None);
+        assert_eq!(add(&conn, "历史文本", 12), loose);
+        assert_eq!(assigned_group(&conn, loose), Some(auto.id));
+        assert_eq!(add(&conn, "手动文本", 12), grouped);
+        assert_eq!(assigned_group(&conn, grouped), Some(manual.id));
+        let clip = list(&conn, Scope::Group(manual.id), "").unwrap().remove(0);
+        assert!(clip.favorite && clip.pinned);
+        assert_eq!(list(&conn, Scope::All, "").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn optional_backfill_honors_priority_selected_types_and_existing_groups() {
+        let conn = mem();
+        let loose = add(&conn, "已有文字", 12);
+        let image = add_image(&conn, "existing.png", 0);
+        let manual = create_group(&conn, "手动", &[], false).unwrap();
+        let grouped = add(&conn, "已分组", 9);
+        set_group(&conn, grouped, Some(manual.id)).unwrap();
+        toggle_favorite(&conn, loose).unwrap();
+        toggle_pinned(&conn, loose).unwrap();
+        let first = create_group(&conn, "优先文字", &[ClipKind::Text], false).unwrap();
+        let later = create_group(&conn, "次序文字", &[ClipKind::Text], true).unwrap();
+        assert_eq!(assigned_group(&conn, loose), Some(first.id));
+        assert_eq!(assigned_group(&conn, grouped), Some(manual.id));
+        assert_eq!(assigned_group(&conn, image), None);
+        assert!(list(&conn, Scope::Group(later.id), "").unwrap().is_empty());
+        let clip = list(&conn, Scope::Group(first.id), "").unwrap().remove(0);
+        assert!(clip.favorite && clip.pinned);
+        update_group(&conn, later.id, "次序图片", &[ClipKind::Image], true).unwrap();
+        assert_eq!(assigned_group(&conn, image), Some(later.id));
+        assert_eq!(list_groups(&conn).unwrap()[2].auto_types, [ClipKind::Image]);
+    }
+
+    #[test]
+    fn editing_or_disabling_rules_keeps_existing_items_and_can_backfill_later() {
+        let conn = mem();
+        let group = create_group(&conn, "文字", &[ClipKind::Text], false).unwrap();
+        let old = add(&conn, "保留归属", 12);
+        update_group(&conn, group.id, "手动整理", &[], true).unwrap();
+        let loose = add(&conn, "不再自动", 12);
+        assert_eq!(assigned_group(&conn, old), Some(group.id));
+        assert_eq!(assigned_group(&conn, loose), None);
+        update_group(&conn, group.id, "恢复自动", &[ClipKind::Text], false).unwrap();
+        assert_eq!(assigned_group(&conn, loose), None);
+        update_group(&conn, group.id, "归入历史", &[ClipKind::Text], true).unwrap();
+        assert_eq!(assigned_group(&conn, loose), Some(group.id));
+        assert!(update_group(&conn, -1, "不存在", &[ClipKind::Image], true).is_err());
+    }
+
+    #[test]
+    fn deleting_auto_group_removes_rules_and_retains_history() {
+        let conn = mem();
+        let group = create_group(&conn, "自动", &[ClipKind::Text], false).unwrap();
+        let id = add(&conn, "保留记录", 12);
+        delete_group(&conn, group.id, false).unwrap();
+        assert_eq!(assigned_group(&conn, id), None);
+        assert!(group_auto_types(&conn, group.id).unwrap().is_empty());
+        assert_eq!(assigned_group(&conn, add(&conn, "后续记录", 12)), None);
+        assert!(get(&conn, id).unwrap().is_some());
+    }
+
+    #[test]
+    fn rule_types_reject_unknown_values_and_deduplicate_selections() {
+        assert!(serde_json::from_str::<ClipKind>("\"file\"").is_err());
+        let conn = mem();
+        let group = create_group(
+            &conn,
+            "去重",
+            &[ClipKind::Image, ClipKind::Text, ClipKind::Text],
+            false,
+        )
+        .unwrap();
+        assert_eq!(group.auto_types, [ClipKind::Text, ClipKind::Image]);
+        let json = serde_json::to_value(list_groups(&conn).unwrap()).unwrap();
+        assert_eq!(json[0]["autoTypes"], serde_json::json!(["text", "image"]));
+    }
+
+    #[test]
+    fn auto_rules_survive_reopening_the_database() {
+        let path = std::env::temp_dir().join(format!(
+            "clipkeep-auto-rules-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let group_id = {
+            let conn = open(&path).unwrap();
+            create_group(
+                &conn,
+                "持久规则",
+                &[ClipKind::Text, ClipKind::Image, ClipKind::Hex],
+                false,
+            )
+            .unwrap()
+            .id
+        };
+        {
+            let conn = open(&path).unwrap();
+            let groups = list_groups(&conn).unwrap();
+            assert_eq!(
+                groups[0].auto_types,
+                [ClipKind::Text, ClipKind::Image, ClipKind::Hex]
+            );
+            assert_eq!(
+                assigned_group(&conn, add(&conn, "重启后文字", 15)),
+                Some(group_id)
+            );
+            assert_eq!(
+                assigned_group(&conn, add_image(&conn, "restart.png", 0)),
+                Some(group_id)
+            );
+            assert_eq!(
+                assigned_group(&conn, add(&conn, "#f008", 5)),
+                Some(group_id)
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn group_rules_and_backfill_roll_back_together() {
+        let mut conn = mem();
+        let id = add(&conn, "事务记录", 12);
+        {
+            let tx = conn.transaction().unwrap();
+            let group = create_group(&tx, "临时分组", &[ClipKind::Text], true).unwrap();
+            assert_eq!(assigned_group(&tx, id), Some(group.id));
+            // Dropping the uncommitted transaction rolls back metadata, rules and membership.
+        }
+        assert!(list_groups(&conn).unwrap().is_empty());
+        assert_eq!(assigned_group(&conn, id), None);
+        assert_eq!(assigned_group(&conn, add(&conn, "回滚之后", 12)), None);
     }
 
     #[test]
@@ -739,7 +1228,7 @@ mod tests {
         let other = add(&conn, "already here", 12);
         toggle_favorite(&conn, id).unwrap();
         toggle_pinned(&conn, id).unwrap();
-        let group = create_group(&conn, "常用").unwrap();
+        let group = create_group(&conn, "常用", &[], false).unwrap();
         set_group(&conn, id, Some(group.id)).unwrap();
         let long = "新内容".repeat(PREVIEW_CHARS);
         edit_text(&conn, id, &long, 0).unwrap();
@@ -816,7 +1305,7 @@ mod tests {
         let pinned = add(&conn, "pinned", 30);
         toggle_pinned(&conn, pinned).unwrap();
         let grouped = add(&conn, "grouped", 40);
-        let group = create_group(&conn, "work").unwrap();
+        let group = create_group(&conn, "work", &[], false).unwrap();
         set_group(&conn, grouped, Some(group.id)).unwrap();
         upsert(
             &conn,
@@ -878,7 +1367,7 @@ mod tests {
             let pf = add(&conn, "pinned+fav", 1);
             toggle_pinned(&conn, pf).unwrap();
             toggle_favorite(&conn, pf).unwrap();
-            let g = create_group(&conn, "工作").unwrap();
+            let g = create_group(&conn, "工作", &[], false).unwrap();
             let gi = add(&conn, "grouped", 1);
             set_group(&conn, gi, Some(g.id)).unwrap();
             let f = add(&conn, "fav", 1);
@@ -906,8 +1395,8 @@ mod tests {
     #[test]
     fn groups_reorder_and_delete_returns_items_to_history() {
         let conn = mem();
-        let a = create_group(&conn, "A").unwrap();
-        let b = create_group(&conn, "B").unwrap();
+        let a = create_group(&conn, "A", &[], false).unwrap();
+        let b = create_group(&conn, "B", &[], false).unwrap();
         reorder_groups(&conn, &[b.id, a.id]).unwrap();
         let names: Vec<String> = list_groups(&conn)
             .unwrap()

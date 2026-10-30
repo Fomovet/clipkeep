@@ -12,7 +12,7 @@ mod win;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use clipboard::Captured;
-use db::{Group, NewClip, RawClip, Scope};
+use db::{ClipKind, Group, NewClip, RawClip, Scope};
 use images::{ImageStore, Rgba};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -394,14 +394,57 @@ fn list_groups(core: State<Core>) -> CmdResult<Vec<Group>> {
 }
 
 #[tauri::command]
-fn create_group(app: AppHandle, core: State<Core>, name: String) -> CmdResult<Group> {
+fn create_group(
+    app: AppHandle,
+    core: State<Core>,
+    name: String,
+    auto_types: Option<Vec<ClipKind>>,
+    include_existing: Option<bool>,
+) -> CmdResult<Group> {
     let name = name.trim();
     if name.is_empty() {
         return Err("分组名不能为空".into());
     }
-    let group = db::create_group(&*core.conn()?, name).map_err(to_err)?;
+    let group = {
+        let mut conn = core.conn()?;
+        let tx = conn.transaction().map_err(to_err)?;
+        let group = db::create_group(
+            &tx,
+            name,
+            &auto_types.unwrap_or_default(),
+            include_existing.unwrap_or(false),
+        )
+        .map_err(to_err)?;
+        tx.commit().map_err(to_err)?;
+        group
+    };
     let _ = app.emit("groups-changed", ());
+    changed(&app);
     Ok(group)
+}
+
+#[tauri::command]
+fn update_group(
+    app: AppHandle,
+    core: State<Core>,
+    id: i64,
+    name: String,
+    auto_types: Vec<ClipKind>,
+    include_existing: bool,
+) -> CmdResult<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("分组名不能为空".into());
+    }
+    {
+        let mut conn = core.conn()?;
+        let tx = conn.transaction().map_err(to_err)?;
+        db::update_group(&tx, id, name, &auto_types, include_existing).map_err(to_err)?;
+        tx.commit().map_err(to_err)?;
+    }
+    let _ = app.emit("groups-changed", ());
+    changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -859,6 +902,8 @@ struct BundleGroup {
     id: i64,
     name: String,
     sort_order: i64,
+    #[serde(default)]
+    auto_types: Vec<ClipKind>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -905,6 +950,7 @@ async fn export_data(app: AppHandle) -> CmdResult<Option<String>> {
             id: g.id,
             name: g.name,
             sort_order: g.sort_order,
+            auto_types: g.auto_types,
         })
         .collect();
     let mut count = 0usize;
@@ -1032,7 +1078,11 @@ async fn import_data(app: AppHandle) -> CmdResult<Option<String>> {
         for g in &bundle.groups {
             let new_id = match existing.get(&g.name) {
                 Some(&id) => id,
-                None => db::create_group(&tx, &g.name).map_err(to_err)?.id,
+                None => {
+                    db::create_group(&tx, &g.name, &g.auto_types, false)
+                        .map_err(to_err)?
+                        .id
+                }
             };
             id_map.insert(g.id, new_id);
         }
@@ -1250,6 +1300,33 @@ fn reveal_tray_menu(app: &AppHandle, window: &WebviewWindow) {
     }
     let _ = window.set_focus();
     let _ = window.emit("tray-menu-shown", ());
+}
+
+#[cfg(test)]
+mod group_backup_tests {
+    use super::{BundleGroup, ClipKind};
+
+    #[test]
+    fn old_backups_default_to_manual_groups() {
+        let group: BundleGroup =
+            serde_json::from_str(r#"{"id":1,"name":"旧分组","sortOrder":0}"#).unwrap();
+        assert!(group.auto_types.is_empty());
+    }
+
+    #[test]
+    fn backup_round_trip_preserves_auto_types() {
+        let group = BundleGroup {
+            id: 1,
+            name: "自动分类".into(),
+            sort_order: 2,
+            auto_types: vec![ClipKind::Text, ClipKind::Image, ClipKind::Hex],
+        };
+        let json = serde_json::to_string(&group).unwrap();
+        let restored: BundleGroup = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.auto_types, group.auto_types);
+        assert_eq!(restored.name, group.name);
+        assert_eq!(restored.sort_order, group.sort_order);
+    }
 }
 
 #[cfg(test)]
@@ -1779,6 +1856,7 @@ pub fn run() {
             clear_data,
             list_groups,
             create_group,
+            update_group,
             rename_group,
             delete_group,
             reorder_groups,
