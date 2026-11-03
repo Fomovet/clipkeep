@@ -1744,8 +1744,9 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
         });
-    if let Some(icon) = app.default_window_icon() {
-        tray = tray.icon(icon.clone());
+    // The same small icon the update badge is drawn on, so adding the dot changes nothing else.
+    if let Some(icon) = update::tray_icon(app) {
+        tray = tray.icon(icon);
     }
     tray.build(app)?;
     Ok(())
