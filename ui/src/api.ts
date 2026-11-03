@@ -14,6 +14,8 @@ export interface Clip {
   updatedAt: number;
   source: string | null;
   groupId: number | null;
+  /** Set when the whole text is one hex colour such as `#2563eb`. */
+  color: string | null;
   thumb: string | null;
 }
 

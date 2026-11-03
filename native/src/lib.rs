@@ -13,7 +13,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use clipboard::Captured;
 use db::{Group, NewClip, RawClip, Scope};
-use images::{ImageStore, Rgba};
+use images::ImageStore;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsFile};
@@ -170,6 +170,23 @@ fn changed(app: &AppHandle) {
     let _ = app.emit("clips-changed", ());
 }
 
+/// Copies waiting to be saved. Hashing, PNG encoding and thumbnails take a while for a large
+/// picture; if the clipboard listener did that itself, a copy made meanwhile would be read only
+/// after the next one replaced it, and lost. The listener just reads and queues; one worker
+/// saves in order, so the list order still matches the copy order.
+const CAPTURE_QUEUE: usize = 16;
+
+fn start_capture_worker(app: AppHandle) -> std::sync::mpsc::SyncSender<Captured> {
+    let (queue, captures) = std::sync::mpsc::sync_channel::<Captured>(CAPTURE_QUEUE);
+    std::thread::spawn(move || {
+        for captured in captures {
+            on_local_copy(&app, captured);
+        }
+    });
+    queue
+}
+
+/// Runs on the capture worker, never on the clipboard listener.
 fn on_local_copy(app: &AppHandle, captured: Captured) {
     if clipboard::capture_paused() {
         return;
@@ -184,34 +201,26 @@ fn on_local_copy(app: &AppHandle, captured: Captured) {
                 .and_then(|saved| core.save_image(&saved, None))
         }
         Captured::ImageFiles(paths) => {
-            // A file selection can contain several large JPEGs. Keep decoding and PNG
-            // thumbnail generation off the clipboard listener so later copies aren't missed.
-            let app = app.clone();
-            std::thread::spawn(move || {
-                let core = app.state::<Core>();
-                let mut saved_any = false;
-                for path in paths {
-                    if clipboard::capture_paused() {
-                        break;
-                    }
-                    let result = images::decode_file(&path).and_then(|img| {
-                        let hash = images::hash(&img);
-                        let source = path.file_name().map(|name| name.to_string_lossy());
-                        core.images
-                            .write(&img, &hash)
-                            .and_then(|saved| core.save_image(&saved, source.as_deref()))
-                    });
-                    match result {
-                        Ok(()) => saved_any = true,
-                        Err(e) => {
-                            eprintln!("save copied image file {} failed: {e}", path.display())
-                        }
-                    }
+            let mut saved_any = false;
+            for path in paths {
+                if clipboard::capture_paused() {
+                    break;
                 }
-                if saved_any {
-                    changed(&app);
+                let result = images::decode_file(&path).and_then(|img| {
+                    let hash = images::hash(&img);
+                    let source = path.file_name().map(|name| name.to_string_lossy());
+                    core.images
+                        .write(&img, &hash)
+                        .and_then(|saved| core.save_image(&saved, source.as_deref()))
+                });
+                match result {
+                    Ok(()) => saved_any = true,
+                    Err(e) => eprintln!("save copied image file {} failed: {e}", path.display()),
                 }
-            });
+            }
+            if saved_any {
+                changed(app);
+            }
             return;
         }
     };
@@ -432,8 +441,9 @@ fn reorder_groups(app: AppHandle, core: State<Core>, ids: Vec<i64>) -> CmdResult
 }
 
 /// Reads the stored item and puts it on the clipboard. Image decoding happens before the lock is
-/// taken so a large image never blocks other DB users.
-fn put_on_clipboard(core: &Core, id: i64) -> CmdResult<()> {
+/// taken so a large image never blocks other DB users. `to_top` moves the item to the top of
+/// the list as most recently used.
+fn put_on_clipboard(core: &Core, id: i64, to_top: bool) -> CmdResult<()> {
     let (kind, content) = db::get(&*core.conn()?, id)
         .map_err(to_err)?
         .ok_or("条目不存在")?;
@@ -457,7 +467,7 @@ fn put_on_clipboard(core: &Core, id: i64) -> CmdResult<()> {
     } else {
         clipboard::write_text(&content).map_err(to_err)?;
     }
-    db::touch(&*core.conn()?, id).map_err(to_err)?;
+    db::touch(&*core.conn()?, id, to_top).map_err(to_err)?;
     Ok(())
 }
 
@@ -484,8 +494,7 @@ fn paste_file_name(source: Option<&str>) -> String {
                 && !((upper.starts_with("COM") || upper.starts_with("LPT")) && upper.len() == 4)
         });
     let stem = stem.unwrap_or_else(|| {
-        let mut t = windows_sys::Win32::Foundation::SYSTEMTIME::default();
-        unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
+        let t = local_time();
         format!(
             "clipkeep_{:04}{:02}{:02}_{:02}{:02}{:02}",
             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
@@ -494,13 +503,26 @@ fn paste_file_name(source: Option<&str>) -> String {
     format!("{stem}.png")
 }
 
+/// With the pin on, the panel stays up so several items can be pasted one after another, and
+/// the list keeps its order so the next item is still where the user saw it. Returns whether
+/// the panel is pinned.
+fn hide_unless_pinned(app: &AppHandle) -> bool {
+    let pinned = app
+        .try_state::<Core>()
+        .is_some_and(|core| core.settings().keep_on_blur);
+    if !pinned {
+        hide_main(app);
+    }
+    pinned
+}
+
 #[tauri::command]
 fn paste_clip(app: AppHandle, id: i64) {
-    hide_main(&app);
+    let pinned = hide_unless_pinned(&app);
     // Off the UI thread: decoding/encoding a large image would otherwise freeze the window.
     std::thread::spawn(move || {
         let core = app.state::<Core>();
-        match put_on_clipboard(&core, id) {
+        match put_on_clipboard(&core, id, !pinned) {
             Ok(()) => {
                 changed(&app);
                 win::paste_to_previous_window();
@@ -512,10 +534,10 @@ fn paste_clip(app: AppHandle, id: i64) {
 
 #[tauri::command]
 fn copy_clip(app: AppHandle, id: i64) {
-    hide_main(&app);
+    let pinned = hide_unless_pinned(&app);
     std::thread::spawn(move || {
         let core = app.state::<Core>();
-        match put_on_clipboard(&core, id) {
+        match put_on_clipboard(&core, id, !pinned) {
             Ok(()) => changed(&app),
             Err(e) => eprintln!("copy failed: {e}"),
         }
@@ -888,8 +910,10 @@ async fn export_data(app: AppHandle) -> CmdResult<Option<String>> {
     };
     let path = path.into_path().map_err(to_err)?;
 
-    // Snapshot ids and groups under a brief lock, then fetch and encode each row lock-free and
-    // stream it to disk, so neither the DB nor memory is tied up for the whole export.
+    // Snapshot ids and groups under a brief lock, then stream the rows to disk one at a time,
+    // so neither the DB nor memory is tied up for the whole export. Each row and its PNG file
+    // are read under a short per-row lock (so cleanup can't delete the picture in between);
+    // base64 encoding and writing happen after it is released.
     let (ids, groups) = {
         let core = app.state::<Core>();
         let conn = core.conn()?;
@@ -977,139 +1001,120 @@ async fn import_data(app: AppHandle) -> CmdResult<Option<String>> {
     if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_IMPORT_FILE {
         return Err("备份文件过大".into());
     }
-    let data = std::fs::read(&path).map_err(to_err)?;
-    let bundle: Bundle = serde_json::from_slice(&data).map_err(|_| "文件格式不正确".to_string())?;
-    drop(data);
+    // Parse straight from the file: holding its bytes and the parsed backup at the same time
+    // would double the memory a large backup needs.
+    let file = std::fs::File::open(&path).map_err(to_err)?;
+    let bundle: Bundle = serde_json::from_reader(io::BufReader::new(file))
+        .map_err(|_| "文件格式不正确".to_string())?;
     if bundle.app != "clipkeep" {
         return Err("不是 clipkeep 备份文件".into());
     }
 
-    // Decode every image up front (outside the lock), so the whole import is one short
-    // transaction that either fully applies or rolls back — no half-imports, no orphan files.
-    enum Pending {
-        Text(String),
-        Image(Rgba),
+    let core = app.state::<Core>();
+    let mut written = Vec::new();
+    let result = import_bundle(&core, bundle, &mut written);
+    if result.is_err() {
+        // Nothing was imported, so drop the pictures this import stored. drop_files keeps any
+        // that an existing item also uses.
+        core.drop_files(&written);
     }
-    let mut pending = Vec::with_capacity(bundle.clips.len());
-    for c in bundle.clips {
-        match (c.kind.as_str(), c.text, c.image_b64) {
-            (db::KIND_TEXT, Some(text), _) => pending.push((
-                Pending::Text(text),
-                c.favorite,
-                c.pinned,
-                c.group_id,
-                c.created_at,
-                c.updated_at,
-            )),
-            (db::KIND_IMAGE, _, Some(b64)) => {
-                let png = STANDARD
-                    .decode(b64.as_bytes())
-                    .map_err(|_| "图片数据损坏".to_string())?;
-                let rgba = images::decode_png(&png)?;
-                pending.push((
-                    Pending::Image(rgba),
-                    c.favorite,
-                    c.pinned,
-                    c.group_id,
-                    c.created_at,
-                    c.updated_at,
-                ));
-            }
-            _ => continue,
-        }
-    }
-
-    let imported = {
-        let core = app.state::<Core>();
-        let mut conn = core.conn()?;
-        let tx = conn.transaction().map_err(to_err)?;
-        let existing: HashMap<String, i64> = db::list_groups(&tx)
-            .map_err(to_err)?
-            .into_iter()
-            .map(|g| (g.name, g.id))
-            .collect();
-        let mut id_map: HashMap<i64, i64> = HashMap::new();
-        for g in &bundle.groups {
-            let new_id = match existing.get(&g.name) {
-                Some(&id) => id,
-                None => db::create_group(&tx, &g.name).map_err(to_err)?.id,
-            };
-            id_map.insert(g.id, new_id);
-        }
-        let mut count = 0usize;
-        for (payload, favorite, pinned, group_id, created_at, updated_at) in pending {
-            let group_id = group_id.and_then(|old| id_map.get(&old).copied());
-            let raw = match payload {
-                Pending::Text(text) => RawClip {
-                    hash: db::text_hash(&text),
-                    size: text.len() as i64,
-                    kind: db::KIND_TEXT.into(),
-                    content: text,
-                    width: None,
-                    height: None,
-                    favorite,
-                    pinned,
-                    group_id,
-                    created_at,
-                    updated_at,
-                },
-                Pending::Image(rgba) => {
-                    let hash = images::hash(&rgba);
-                    let saved = core.images.write(&rgba, &hash)?;
-                    RawClip {
-                        kind: db::KIND_IMAGE.into(),
-                        content: saved.file,
-                        hash: saved.hash,
-                        width: Some(saved.width as i64),
-                        height: Some(saved.height as i64),
-                        size: saved.bytes as i64,
-                        favorite,
-                        pinned,
-                        group_id,
-                        created_at,
-                        updated_at,
-                    }
-                }
-            };
-            db::import_clip(&tx, &raw).map_err(to_err)?;
-            count += 1;
-        }
-        tx.commit().map_err(to_err)?;
-        let files = db::enforce_storage(&conn, core.max_bytes()).map_err(to_err)?;
-        drop(conn);
-        core.drop_files(&files);
-        count
-    };
+    let imported = result?;
 
     let _ = app.emit("groups-changed", ());
     changed(&app);
     Ok(Some(format!("已导入 {imported} 条")))
 }
 
-/// Local time as YYYYMMDD-HHMMSS, for default export file names.
-fn chrono_stamp() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (y, m, d) = civil_from_days((secs / 86400) as i64);
-    let (hh, mm, ss) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
+/// Stores each picture as soon as it is decoded, outside the DB lock, so memory holds one
+/// decoded picture at a time rather than all of them. The rows then go in as one short
+/// transaction that fully applies or rolls back. `written` collects the stored image files so
+/// the caller can remove them again if the import fails.
+fn import_bundle(core: &Core, bundle: Bundle, written: &mut Vec<String>) -> CmdResult<usize> {
+    let mut rows = Vec::with_capacity(bundle.clips.len());
+    for c in bundle.clips {
+        let raw = match (c.kind.as_str(), c.text, c.image_b64) {
+            (db::KIND_TEXT, Some(text), _) => RawClip {
+                hash: db::text_hash(&text),
+                size: text.len() as i64,
+                kind: db::KIND_TEXT.into(),
+                content: text,
+                width: None,
+                height: None,
+                favorite: c.favorite,
+                pinned: c.pinned,
+                group_id: c.group_id,
+                created_at: c.created_at,
+                updated_at: c.updated_at,
+            },
+            (db::KIND_IMAGE, _, Some(b64)) => {
+                let png = STANDARD
+                    .decode(b64.as_bytes())
+                    .map_err(|_| "图片数据损坏".to_string())?;
+                drop(b64);
+                let rgba = images::decode_png(&png)?;
+                drop(png);
+                let saved = core.images.write(&rgba, &images::hash(&rgba))?;
+                written.push(saved.file.clone());
+                RawClip {
+                    kind: db::KIND_IMAGE.into(),
+                    content: saved.file,
+                    hash: saved.hash,
+                    width: Some(saved.width as i64),
+                    height: Some(saved.height as i64),
+                    size: saved.bytes as i64,
+                    favorite: c.favorite,
+                    pinned: c.pinned,
+                    group_id: c.group_id,
+                    created_at: c.created_at,
+                    updated_at: c.updated_at,
+                }
+            }
+            _ => continue,
+        };
+        rows.push(raw);
+    }
+
+    let mut conn = core.conn()?;
+    let tx = conn.transaction().map_err(to_err)?;
+    let existing: HashMap<String, i64> = db::list_groups(&tx)
+        .map_err(to_err)?
+        .into_iter()
+        .map(|g| (g.name, g.id))
+        .collect();
+    let mut id_map: HashMap<i64, i64> = HashMap::new();
+    for g in &bundle.groups {
+        let new_id = match existing.get(&g.name) {
+            Some(&id) => id,
+            None => db::create_group(&tx, &g.name).map_err(to_err)?.id,
+        };
+        id_map.insert(g.id, new_id);
+    }
+    let count = rows.len();
+    for mut raw in rows {
+        raw.group_id = raw.group_id.and_then(|old| id_map.get(&old).copied());
+        db::import_clip(&tx, &raw).map_err(to_err)?;
+    }
+    tx.commit().map_err(to_err)?;
+    let files = db::enforce_storage(&conn, core.max_bytes()).map_err(to_err)?;
+    drop(conn);
+    core.drop_files(&files);
+    Ok(count)
 }
 
-/// Howard Hinnant's days-to-civil-date algorithm (UTC); good enough for a file name.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
+/// The wall-clock time the user sees, for file names.
+fn local_time() -> windows_sys::Win32::Foundation::SYSTEMTIME {
+    let mut t = windows_sys::Win32::Foundation::SYSTEMTIME::default();
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
+    t
+}
+
+/// Local time as YYYYMMDD-HHMMSS, for export and corrupt-database file names.
+fn chrono_stamp() -> String {
+    let t = local_time();
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+    )
 }
 
 fn main_window(app: &AppHandle) -> Option<WebviewWindow> {
@@ -1250,6 +1255,160 @@ fn reveal_tray_menu(app: &AppHandle, window: &WebviewWindow) {
     }
     let _ = window.set_focus();
     let _ = window.emit("tray-menu-shown", ());
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    struct TempCore {
+        core: Core,
+        dir: PathBuf,
+    }
+
+    impl Drop for TempCore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn temp_core() -> TempCore {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "clipkeep-import-test-{}",
+            u64::from_ne_bytes(random)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let core = Core {
+            db: Mutex::new(db::open(&dir.join("clipkeep.db")).unwrap()),
+            images: ImageStore::new(&dir).unwrap(),
+            lan: lan::LanService::new(&dir),
+            settings: RwLock::new(Settings::default()),
+            settings_file: SettingsFile::new(&dir),
+            position_dirty: AtomicBool::new(false),
+            data_dir: dir.clone(),
+        };
+        TempCore { core, dir }
+    }
+
+    fn png_b64(shade: u8) -> String {
+        use image::ImageEncoder as _;
+        let pixels = vec![shade; 4 * 4 * 4];
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&pixels, 4, 4, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        STANDARD.encode(png)
+    }
+
+    fn clip(text: Option<&str>, image: Option<String>, group_id: Option<i64>) -> BundleClip {
+        BundleClip {
+            kind: if image.is_some() { "image" } else { "text" }.into(),
+            text: text.map(str::to_owned),
+            image_b64: image,
+            favorite: false,
+            pinned: false,
+            group_id,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn bundle(clips: Vec<BundleClip>) -> Bundle {
+        Bundle {
+            app: "clipkeep".into(),
+            groups: vec![BundleGroup {
+                id: 7,
+                name: "工作".into(),
+                sort_order: 0,
+            }],
+            clips,
+        }
+    }
+
+    fn stored_images(dir: &Path) -> usize {
+        let Ok(shards) = std::fs::read_dir(dir.join("images")) else {
+            return 0;
+        };
+        shards
+            .flatten()
+            .filter_map(|shard| std::fs::read_dir(shard.path()).ok())
+            .flat_map(|files| files.flatten())
+            .filter(|f| f.path().extension().is_some_and(|e| e == "png"))
+            .count()
+    }
+
+    fn rows(core: &Core) -> usize {
+        db::list(&core.conn().unwrap(), Scope::All, "")
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn imports_text_images_and_groups() {
+        let t = temp_core();
+        let mut written = Vec::new();
+        let count = import_bundle(
+            &t.core,
+            bundle(vec![
+                clip(Some("备份文字"), None, Some(7)),
+                clip(None, Some(png_b64(200)), None),
+            ]),
+            &mut written,
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(rows(&t.core), 2);
+        assert_eq!(stored_images(&t.dir), 1);
+        let groups = db::list_groups(&t.core.conn().unwrap()).unwrap();
+        let grouped = db::list(&t.core.conn().unwrap(), Scope::Group(groups[0].id), "").unwrap();
+        assert_eq!(grouped[0].preview, "备份文字");
+    }
+
+    #[test]
+    fn a_failed_import_adds_nothing_and_leaves_no_picture_behind() {
+        let t = temp_core();
+        let mut written = Vec::new();
+        let result = import_bundle(
+            &t.core,
+            bundle(vec![
+                clip(Some("不该出现"), None, None),
+                clip(None, Some(png_b64(10)), None),
+                clip(None, Some("不是图片".into()), None),
+            ]),
+            &mut written,
+        );
+        assert!(result.is_err());
+        // What import_data does on failure.
+        t.core.drop_files(&written);
+        assert_eq!(rows(&t.core), 0);
+        assert_eq!(stored_images(&t.dir), 0);
+    }
+
+    #[test]
+    fn cleanup_after_a_failed_import_keeps_pictures_already_in_history() {
+        let t = temp_core();
+        import_bundle(
+            &t.core,
+            bundle(vec![clip(None, Some(png_b64(90)), None)]),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let mut written = Vec::new();
+        let result = import_bundle(
+            &t.core,
+            bundle(vec![
+                clip(None, Some(png_b64(90)), None),
+                clip(None, Some("坏数据".into()), None),
+            ]),
+            &mut written,
+        );
+        assert!(result.is_err());
+        t.core.drop_files(&written);
+        assert_eq!(rows(&t.core), 1);
+        assert_eq!(stored_images(&t.dir), 1);
+    }
 }
 
 #[cfg(test)]
@@ -1714,9 +1873,14 @@ pub fn run() {
             app.manage(core);
             handle.state::<Core>().lan.restore(&handle);
 
-            let monitor_handle = handle.clone();
-            clipboard::start_monitor(move |captured| on_local_copy(&monitor_handle, captured));
+            let captures = start_capture_worker(handle.clone());
+            clipboard::start_monitor(move |captured| {
+                if captures.send(captured).is_err() {
+                    eprintln!("capture worker stopped; copy not saved");
+                }
+            });
 
+            win::start_foreground_tracking();
             let hook_handle = handle.clone();
             win::install_hotkey_hook(move || {
                 let h = hook_handle.clone();

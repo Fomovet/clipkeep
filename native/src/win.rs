@@ -13,15 +13,18 @@ use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM
 use windows_sys::Win32::Globalization::{CP_OEMCP, MultiByteToWideChar};
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
     VK_CONTROL, VK_LMENU, VK_LWIN, VK_MENU, VK_OEM_3, VK_RMENU, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
-    GetWindowThreadProcessId, HC_ACTION, HHOOK, IsHungAppWindow, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-    MSG, SetForegroundWindow, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    BringWindowToTop, CallNextHookEx, DispatchMessageW, EVENT_SYSTEM_FOREGROUND,
+    GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HC_ACTION, HHOOK, IsHungAppWindow,
+    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, OBJID_WINDOW, SetForegroundWindow, SetTimer,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER,
 };
 
 const VK_V: u16 = 0x56;
@@ -442,15 +445,64 @@ pub fn disable_transitions(hwnd: HWND) {
     }
 }
 
+/// Records `hwnd` as the paste target unless it belongs to clipkeep itself.
+fn remember_window(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if pid != 0 && pid != std::process::id() {
+        PREV_FOREGROUND.store(hwnd as isize, Ordering::Relaxed);
+    }
+}
+
 /// Call right before showing our window, so a paste can go back to where the user was typing.
 pub fn remember_foreground() {
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if !hwnd.is_null() && pid != std::process::id() {
-            PREV_FOREGROUND.store(hwnd as isize, Ordering::Relaxed);
+    remember_window(unsafe { GetForegroundWindow() });
+}
+
+/// Keeps the paste target current while the panel stays open. With the pin on, the user can
+/// click into another window between pastes; the next paste must go there, not to the window
+/// that was in front when the panel opened.
+pub fn start_foreground_tracking() {
+    thread::spawn(|| unsafe {
+        // Out-of-context events arrive through this thread's message loop.
+        let hook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            null_mut(),
+            Some(on_foreground_changed),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        if hook.is_null() {
+            log_diagnostic(&format!(
+                "foreground-tracking-failed error={}",
+                GetLastError()
+            ));
+            return;
         }
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    });
+}
+
+unsafe extern "system" fn on_foreground_changed(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if id_object == OBJID_WINDOW {
+        remember_window(hwnd);
     }
 }
 

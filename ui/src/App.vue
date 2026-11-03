@@ -852,7 +852,7 @@ onUnmounted(() => {
           <button
             class="icon-btn"
             :class="{ on: pinnedWindow }"
-            :title="pinnedWindow ? '已固定（失焦不隐藏）' : '固定窗口'"
+            :title="pinnedWindow ? '已固定（粘贴后和失焦时都不隐藏）' : '固定窗口（可连续粘贴多条）'"
             @click="togglePinnedWindow"
           >
             <ClipIcon name="pin" />
@@ -898,12 +898,16 @@ onUnmounted(() => {
               <span class="image-name" :title="c.source || '剪贴板图片'">{{ c.source || '剪贴板图片' }}</span>
               <span v-if="c.width && c.height" class="image-dimensions">{{ c.width }} × {{ c.height }}</span>
             </div>
+            <div v-else-if="c.color" class="hex-preview">
+              <span class="hex-swatch" aria-hidden="true"><span :style="{ backgroundColor: c.color }"></span></span>
+              <span class="hex-value">{{ c.color }}</span>
+            </div>
             <div v-else class="text">{{ c.preview }}<span v-if="c.truncated" class="more">…</span></div>
             <div class="item-footer">
               <div class="meta">
                 <span class="meta-time">{{ timeAgo(c.updatedAt) }}</span>
                 <span class="meta-dot" aria-hidden="true">·</span>
-                <span class="meta-type"><ClipIcon :name="c.kind === 'image' ? 'image' : 'file-text'" class="tiny" />{{ c.kind === 'image' ? '图片' : '文本' }}</span>
+                <span class="meta-type"><ClipIcon :name="c.kind === 'image' ? 'image' : c.color ? 'palette' : 'file-text'" class="tiny" />{{ c.kind === 'image' ? '图片' : c.color ? 'HEX 色值' : '文本' }}</span>
                 <span v-if="c.pinned" class="meta-flag pin-flag"><ClipIcon name="pin" class="tiny" />置顶</span>
                 <span v-if="scope !== 'group' && groupName(c.groupId)" class="meta-flag group-flag" :title="groupName(c.groupId) ?? ''"><ClipIcon name="folder" class="tiny" /><span class="group-label">{{ groupName(c.groupId) }}</span></span>
               </div>
@@ -1315,6 +1319,20 @@ onUnmounted(() => {
   font-weight: 500;
 }
 .image-dimensions { color: var(--muted); font-size: var(--fs-xs); }
+.hex-preview { display: flex; align-items: center; gap: 10px; min-height: 44px; }
+/* The checkerboard shows through colours with transparency (#RGBA / #RRGGBBAA). */
+.hex-swatch {
+  display: block;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  background: repeating-conic-gradient(#ccc 0 25%, #fff 0 50%) 0 0 / 10px 10px;
+}
+.hex-swatch > span { display: block; width: 100%; height: 100%; }
+.hex-value { font-family: ui-monospace, Consolas, monospace; color: var(--text); font-size: var(--fs-lg); }
 .image-body .item-footer { grid-column: 2; margin-top: 0; }
 .item-footer {
   display: flex;
