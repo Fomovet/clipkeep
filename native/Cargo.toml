@@ -1,6 +1,6 @@
 [package]
 name = "clipkeep"
-version = "0.2.1"
+version = "0.2.2"
 description = "clipkeep - clipboard history & favorites"
 authors = ["clipkeep contributors"]
 edition = "2024"
