@@ -94,6 +94,7 @@ export const api = {
   pasteClip: (id: number) => invoke<void>("paste_clip", { id }),
   copyClip: (id: number) => invoke<void>("copy_clip", { id }),
   hideWindow: () => invoke<void>("hide_window"),
+  getRenameSafeMode: () => invoke<boolean>("get_rename_safe_mode"),
   startDrag: () => invoke<void>("start_drag"),
   toggleKeepOnBlur: () => invoke<boolean>("toggle_keep_on_blur"),
   getAutostart: () => invoke<boolean>("get_autostart"),
