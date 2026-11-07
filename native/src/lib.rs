@@ -2,6 +2,7 @@ mod atomic_file;
 mod clipboard;
 mod db;
 mod dib;
+mod focus;
 mod images;
 mod instances;
 mod lan;
@@ -48,6 +49,12 @@ static FOCUS_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// here (stale `true` after a hide), which made the toggle hotkey need two presses; every show/hide
 /// goes through show_main/hide_main, so this flag is the authoritative toggle state.
 static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// The Explorer rename session uses a raw SW_SHOWNOACTIVATE show and therefore must also use
+/// the matching raw hide; Tauri's runtime visibility flag intentionally stays false in this mode.
+static NOACTIVATE_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// The current UI is in non-focus-stealing mode, including when an already-visible pinned panel
+/// protects an Explorer rename editor.
+static PRESERVE_EDITOR_MODE: AtomicBool = AtomicBool::new(false);
 /// Ignore a transient blur while WebView2 is being shown, then check real focus.
 static TRAY_MENU_VISIBLE: AtomicBool = AtomicBool::new(false);
 static TRAY_MENU_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -443,7 +450,7 @@ fn reorder_groups(app: AppHandle, core: State<Core>, ids: Vec<i64>) -> CmdResult
 /// Reads the stored item and puts it on the clipboard. Image decoding happens before the lock is
 /// taken so a large image never blocks other DB users. `to_top` moves the item to the top of
 /// the list as most recently used.
-fn put_on_clipboard(core: &Core, id: i64, to_top: bool) -> CmdResult<()> {
+fn put_on_clipboard(core: &Core, id: i64, to_top: bool, action: focus::Action) -> CmdResult<()> {
     let (kind, content) = db::get(&*core.conn()?, id)
         .map_err(to_err)?
         .ok_or("条目不存在")?;
@@ -458,6 +465,9 @@ fn put_on_clipboard(core: &Core, id: i64, to_top: bool) -> CmdResult<()> {
         } else {
             None
         };
+        if !focus::current(action) {
+            return Err(focus::CANCELLED.into());
+        }
         clipboard::write_image(
             &img,
             file.as_ref()
@@ -465,6 +475,9 @@ fn put_on_clipboard(core: &Core, id: i64, to_top: bool) -> CmdResult<()> {
         )
         .map_err(to_err)?;
     } else {
+        if !focus::current(action) {
+            return Err(focus::CANCELLED.into());
+        }
         clipboard::write_text(&content).map_err(to_err)?;
     }
     db::touch(&*core.conn()?, id, to_top).map_err(to_err)?;
@@ -503,50 +516,102 @@ fn paste_file_name(source: Option<&str>) -> String {
     format!("{stem}.png")
 }
 
-/// With the pin on, the panel stays up so several items can be pasted one after another, and
-/// the list keeps its order so the next item is still where the user saw it. Returns whether
-/// the panel is pinned.
-fn hide_unless_pinned(app: &AppHandle) -> bool {
+/// Worker thread: keep image work and the bounded focus/modifier wait off the UI thread.
+fn return_to_input(
+    app: &AppHandle,
+    action: focus::Action,
+    paste: bool,
+    keep_open: bool,
+) -> CmdResult<()> {
+    // Ignore foreground transitions caused by restoring focus and injecting this paste.
+    let _returning = focus::Returning::new();
+    // A pinned panel stays visible after every paste. Explorer's rename mode is nonfocusable, so
+    // preserving that editor does not require hiding the pinned panel.
+    let hide_after = !keep_open;
+    let (send, recv) = std::sync::mpsc::sync_channel(1);
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        if !focus::current(action) {
+            let _ = send.send(Err(focus::CANCELLED.into()));
+            return;
+        }
+        let restored = focus::restore(action);
+        // A failed paste remains actionable if we still own the popup. Dismissals must
+        // always close, including when the old application has already exited.
+        if hide_after && (restored.is_ok() || !paste || !focus::owns_foreground()) {
+            hide_main_window(&handle);
+        }
+        let _ = send.send(restored);
+    })
+    .map_err(to_err)?;
+    recv.recv().map_err(to_err)??;
+    focus::wait_ready(action, paste).inspect_err(|error| {
+        win::log_diagnostic(&format!(
+            "restore-focus-failed {error} {}",
+            focus::diagnostic(action)
+        ));
+    })?;
+    if paste {
+        // Recheck immediately before injecting; another popup or external click invalidates it.
+        if !focus::target_focused(action)? {
+            return Err("原输入框已失去焦点，内容已复制，请手动粘贴".into());
+        }
+        if !win::send_paste() {
+            return Err("无法发送粘贴按键，内容已复制，请手动粘贴".into());
+        }
+    }
+    Ok(())
+}
+
+async fn transfer_clip(app: AppHandle, id: i64, paste: bool) -> CmdResult<()> {
     let pinned = app
         .try_state::<Core>()
         .is_some_and(|core| core.settings().keep_on_blur);
-    if !pinned {
-        hide_main(app);
-    }
-    pinned
-}
-
-#[tauri::command]
-fn paste_clip(app: AppHandle, id: i64) {
-    let pinned = hide_unless_pinned(&app);
-    // Off the UI thread: decoding/encoding a large image would otherwise freeze the window.
-    std::thread::spawn(move || {
-        let core = app.state::<Core>();
-        match put_on_clipboard(&core, id, !pinned) {
-            Ok(()) => {
-                changed(&app);
-                win::paste_to_previous_window();
+    let action = focus::claim()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| {
+            if !focus::current(action) {
+                return Err(focus::CANCELLED.into());
             }
-            Err(e) => eprintln!("paste failed: {e}"),
-        }
-    });
+            put_on_clipboard(&app.state::<Core>(), id, !pinned, action)?;
+            changed(&app);
+            // A pinned copy-only action leaves a normally focused panel ready for another choice.
+            if !paste && pinned && !focus::preserves_editor(action) {
+                return Ok(());
+            }
+            return_to_input(&app, action, paste, pinned)
+        })();
+        focus::finish(action);
+        result
+    })
+    .await
+    .map_err(to_err)?
 }
 
 #[tauri::command]
-fn copy_clip(app: AppHandle, id: i64) {
-    let pinned = hide_unless_pinned(&app);
-    std::thread::spawn(move || {
-        let core = app.state::<Core>();
-        match put_on_clipboard(&core, id, !pinned) {
-            Ok(()) => changed(&app),
-            Err(e) => eprintln!("copy failed: {e}"),
-        }
-    });
+async fn paste_clip(app: AppHandle, id: i64) -> CmdResult<()> {
+    transfer_clip(app, id, true).await
 }
 
 #[tauri::command]
-fn hide_window(app: AppHandle) {
-    hide_main(&app);
+async fn copy_clip(app: AppHandle, id: i64) -> CmdResult<()> {
+    transfer_clip(app, id, false).await
+}
+
+#[tauri::command]
+async fn hide_window(app: AppHandle) -> CmdResult<()> {
+    let action = focus::dismiss()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = return_to_input(&app, action, false, false);
+        focus::finish(action);
+        result
+    })
+    .await
+    .map_err(to_err)?
+}
+#[tauri::command]
+fn get_rename_safe_mode() -> bool {
+    PRESERVE_EDITOR_MODE.load(Ordering::Relaxed)
 }
 
 /// Opens the download page in the user's browser. A link inside the WebView would navigate the
@@ -1176,6 +1241,7 @@ fn popup_axis(pointer: i32, extent: i32, start: i32, end: i32) -> i32 {
 }
 
 fn show_tray_menu(app: &AppHandle, cursor: PhysicalPosition<f64>) {
+    focus::begin_session();
     let pointer = app.cursor_position().unwrap_or(cursor);
     if let Ok(mut slot) = TRAY_MENU_POINTER.lock() {
         *slot = Some(pointer);
@@ -1566,13 +1632,45 @@ fn set_low_memory(window: &WebviewWindow, low: bool) {
 }
 
 fn hide_main(app: &AppHandle) {
+    focus::cancel();
+    hide_main_window(app);
+}
+
+/// Native close/toggle callbacks cannot await IPC; report the same failure through an event.
+fn dismiss_main(app: &AppHandle) {
+    let Ok(action) = focus::dismiss() else {
+        hide_main(app);
+        return;
+    };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let result = return_to_input(&app, action, false, false);
+        focus::finish(action);
+        if let Err(error) = result
+            && error != focus::CANCELLED
+        {
+            let _ = app.emit("focus-error", error);
+        }
+    });
+}
+
+fn hide_main_window(app: &AppHandle) {
     win::log_diagnostic("hide-main");
     FOCUS_EPOCH.fetch_add(1, Ordering::Relaxed);
     DRAG_HIDE_UNTIL.store(0, Ordering::Relaxed);
     WINDOW_VISIBLE.store(false, Ordering::Relaxed);
+    let no_activate = NOACTIVATE_VISIBLE.swap(false, Ordering::Relaxed);
+    PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
     if let Some(w) = main_window(app) {
         let _ = w.emit("window-hidden", ());
-        if let Err(e) = w.hide() {
+        let hide_result = if no_activate {
+            w.hwnd()
+                .map(|hwnd| win::hide_no_activate(hwnd.0 as _))
+                .map_err(to_err)
+        } else {
+            w.hide().map_err(to_err)
+        };
+        if let Err(e) = hide_result {
             win::log_diagnostic(&format!("hide-main-failed {e}"));
         }
         set_low_memory(&w, true);
@@ -1584,6 +1682,7 @@ fn hide_main(app: &AppHandle) {
 
 fn show_main(app: &AppHandle) {
     win::log_diagnostic("show-main-begin");
+    let preserve_editor = focus::begin_session();
     hide_tray_menu_window(app);
     FOCUS_EPOCH.fetch_add(1, Ordering::Relaxed);
     DRAG_HIDE_UNTIL.store(0, Ordering::Relaxed);
@@ -1591,35 +1690,112 @@ fn show_main(app: &AppHandle) {
         win::log_diagnostic("show-main-no-window");
         return;
     };
-    win::remember_foreground();
     set_low_memory(&w, false);
     place_window(app, &w);
-    let _ = w.unminimize();
     // Showing and focusing the WebView can emit a transient blur event.
     SUPPRESS_HIDE_UNTIL.store(db::now_ms() + SHOW_BLUR_GRACE_MS, Ordering::Relaxed);
-    if let Err(e) = w.show() {
-        win::log_diagnostic(&format!("show-main-failed {e}"));
-        eprintln!("show main window failed: {e}");
-        return;
+    if preserve_editor {
+        if let Err(error) = w.set_focusable(false) {
+            focus::cancel();
+            win::log_diagnostic(&format!("set-nonfocusable-failed {error}"));
+            return;
+        }
+        let Ok(hwnd) = w.hwnd() else {
+            focus::cancel();
+            win::log_diagnostic("show-main-no-hwnd");
+            return;
+        };
+        NOACTIVATE_VISIBLE.store(true, Ordering::Relaxed);
+        PRESERVE_EDITOR_MODE.store(true, Ordering::Relaxed);
+        WINDOW_VISIBLE.store(true, Ordering::Relaxed);
+        if !win::show_no_activate(hwnd.0 as _) {
+            NOACTIVATE_VISIBLE.store(false, Ordering::Relaxed);
+            PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
+            WINDOW_VISIBLE.store(false, Ordering::Relaxed);
+            focus::cancel();
+            win::log_diagnostic("show-main-noactivate-failed");
+            return;
+        }
+    } else {
+        NOACTIVATE_VISIBLE.store(false, Ordering::Relaxed);
+        PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
+        if let Err(e) = w.set_focusable(true) {
+            focus::cancel();
+            win::log_diagnostic(&format!("set-focusable-failed {e}"));
+            return;
+        }
+        let _ = w.unminimize();
+        if let Err(e) = w.show() {
+            win::log_diagnostic(&format!("show-main-failed {e}"));
+            eprintln!("show main window failed: {e}");
+            return;
+        }
+        // show_main already runs on the main thread (dispatched by the hook dispatcher).
+        if let Ok(hwnd) = w.hwnd() {
+            win::force_foreground(hwnd.0 as _);
+        }
+        WINDOW_VISIBLE.store(true, Ordering::Relaxed);
     }
-    // Call force_foreground directly — show_main already runs on the main thread
-    // (dispatched by the hook dispatcher thread via run_on_main_thread).
-    // The previous nested run_on_main_thread here was redundant and caused
-    // re-entrance / blocking that made run_on_main_thread take >300 ms,
-    // causing Windows to silently remove the low-level keyboard hook.
-    if let Ok(hwnd) = w.hwnd() {
-        win::force_foreground(hwnd.0 as _);
-    }
-    WINDOW_VISIBLE.store(true, Ordering::Relaxed);
     win::log_diagnostic("show-main-complete");
-    let _ = w.emit("window-shown", ());
+    let _ = w.emit("window-shown", preserve_editor);
+    if preserve_editor {
+        watch_preserved_editor(app);
+    }
+}
+
+fn watch_preserved_editor(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        loop {
+            if !WINDOW_VISIBLE.load(Ordering::Relaxed)
+                || !PRESERVE_EDITOR_MODE.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            if !focus::preserved_editor_active() {
+                // Follow the new destination. If it is another Explorer rename edit, keep
+                // protecting it; otherwise a pinned panel can return to normal interaction.
+                if focus::foreground_changed() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                let handle = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if WINDOW_VISIBLE.load(Ordering::Relaxed)
+                        && PRESERVE_EDITOR_MODE.load(Ordering::Relaxed)
+                        && !focus::preserved_editor_active()
+                    {
+                        let pinned = handle
+                            .try_state::<Core>()
+                            .is_some_and(|core| core.settings().keep_on_blur);
+                        if pinned {
+                            if let Some(window) = main_window(&handle) {
+                                if let Err(error) = window.set_focusable(true) {
+                                    win::log_diagnostic(&format!("set-focusable-failed {error}"));
+                                    return;
+                                }
+                                PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
+                                let _ = window.emit("rename-safe-mode-changed", false);
+                                win::log_diagnostic("preserved-editor-released-pinned");
+                            }
+                        } else {
+                            win::log_diagnostic("preserved-editor-dismissed");
+                            hide_main(&handle);
+                        }
+                    }
+                });
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
 }
 
 fn toggle_main(app: &AppHandle) {
     let visible = WINDOW_VISIBLE.load(Ordering::Relaxed);
     win::log_diagnostic(&format!("toggle-main visible={}", visible));
     if visible {
-        hide_main(app);
+        dismiss_main(app);
     } else {
         show_main(app);
     }
@@ -1685,14 +1861,45 @@ fn should_keep_open(app: &AppHandle) -> bool {
 }
 
 fn on_main_focus_changed(app: &AppHandle, focused: bool) {
+    if PRESERVE_EDITOR_MODE.load(Ordering::Relaxed) {
+        return;
+    }
     let epoch = FOCUS_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
     let remaining = SUPPRESS_HIDE_UNTIL.load(Ordering::Relaxed) - db::now_ms();
     win::log_diagnostic(&format!(
         "main-focus focused={focused} visible={} hide-delay-ms={remaining}",
         WINDOW_VISIBLE.load(Ordering::Relaxed)
     ));
-    if focused || !WINDOW_VISIBLE.load(Ordering::Relaxed) {
+    if focused
+        || !WINDOW_VISIBLE.load(Ordering::Relaxed)
+        || focus::is_returning()
+        || focus::owns_foreground()
+    {
         return;
+    }
+    // Keep the destination current while pinned. If the newly focused window is an Explorer
+    // rename edit, make the visible panel nonfocusable instead of dismissing the pinned window.
+    if focus::external_foreground() {
+        let pinned = app
+            .try_state::<Core>()
+            .is_some_and(|core| core.settings().keep_on_blur);
+        if pinned {
+            if focus::foreground_changed() {
+                if let Some(window) = main_window(app) {
+                    if let Err(error) = window.set_focusable(false) {
+                        win::log_diagnostic(&format!("set-nonfocusable-failed {error}"));
+                        hide_main(app);
+                        return;
+                    }
+                    PRESERVE_EDITOR_MODE.store(true, Ordering::Relaxed);
+                    let _ = window.emit("rename-safe-mode-changed", true);
+                    watch_preserved_editor(app);
+                }
+                return;
+            }
+        } else {
+            focus::cancel();
+        }
     }
     if !should_keep_open(app) {
         hide_main(app);
@@ -1717,6 +1924,7 @@ fn on_main_focus_changed(app: &AppHandle, focused: bool) {
             if FOCUS_EPOCH.load(Ordering::Relaxed) == epoch
                 && WINDOW_VISIBLE.load(Ordering::Relaxed)
                 && !should_keep_open(&target)
+                && !focus::owns_foreground()
                 && main_window(&target).is_some_and(|window| !window.is_focused().unwrap_or(false))
             {
                 win::log_diagnostic("deferred-blur-hide");
@@ -1915,7 +2123,7 @@ pub fn run() {
             match event {
                 WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
-                    hide_main(window.app_handle());
+                    dismiss_main(window.app_handle());
                 }
                 WindowEvent::Focused(focused) => {
                     on_main_focus_changed(window.app_handle(), *focused)
@@ -1950,6 +2158,7 @@ pub fn run() {
             paste_clip,
             copy_clip,
             hide_window,
+            get_rename_safe_mode,
             open_release_page,
             get_update_state,
             check_update,

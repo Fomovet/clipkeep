@@ -3,9 +3,7 @@ use std::io::Write;
 use std::mem::size_of;
 use std::path::Path;
 use std::ptr::null_mut;
-use std::sync::atomic::{
-    AtomicBool, AtomicIsize, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
-};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,10 +19,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CallNextHookEx, DispatchMessageW, EVENT_SYSTEM_FOREGROUND,
     GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HC_ACTION, HHOOK, IsHungAppWindow,
-    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, OBJID_WINDOW, SetForegroundWindow, SetTimer,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER,
+    IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, OBJID_WINDOW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SetForegroundWindow, SetTimer, SetWindowsHookExW, ShowWindow,
+    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
 };
 
 const VK_V: u16 = 0x56;
@@ -59,7 +57,6 @@ static HOTKEY_MODS: AtomicU8 = AtomicU8::new(MOD_WIN);
 static HOTKEY_VK: AtomicU16 = AtomicU16::new(VK_V);
 /// True from the first intercepted target-key down until its up (or a modifier release).
 static KEY_SWALLOWED: AtomicBool = AtomicBool::new(false);
-static PREV_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
 static WIN_TRACKED: AtomicU8 = AtomicU8::new(0);
 static LAST_WIN_DOWN_MS: AtomicU32 = AtomicU32::new(0);
 
@@ -445,26 +442,7 @@ pub fn disable_transitions(hwnd: HWND) {
     }
 }
 
-/// Records `hwnd` as the paste target unless it belongs to clipkeep itself.
-fn remember_window(hwnd: HWND) {
-    if hwnd.is_null() {
-        return;
-    }
-    let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
-    if pid != 0 && pid != std::process::id() {
-        PREV_FOREGROUND.store(hwnd as isize, Ordering::Relaxed);
-    }
-}
-
-/// Call right before showing our window, so a paste can go back to where the user was typing.
-pub fn remember_foreground() {
-    remember_window(unsafe { GetForegroundWindow() });
-}
-
-/// Keeps the paste target current while the panel stays open. With the pin on, the user can
-/// click into another window between pastes; the next paste must go there, not to the window
-/// that was in front when the panel opened.
+/// Keeps the active input destination current while a pinned panel stays open.
 pub fn start_foreground_tracking() {
     thread::spawn(|| unsafe {
         // Out-of-context events arrive through this thread's message loop.
@@ -501,11 +479,10 @@ unsafe extern "system" fn on_foreground_changed(
     _thread: u32,
     _time: u32,
 ) {
-    if id_object == OBJID_WINDOW {
-        remember_window(hwnd);
+    if id_object == OBJID_WINDOW && !hwnd.is_null() {
+        crate::focus::foreground_changed();
     }
 }
-
 /// Windows only lets the process that owns the foreground window hand focus away, so borrow its
 /// input queue for the switch. Skipped for a hung app, whose queue could stall ours. UI thread only.
 pub fn force_foreground(hwnd: HWND) {
@@ -526,18 +503,30 @@ pub fn force_foreground(hwnd: HWND) {
     }
 }
 
-pub fn paste_to_previous_window() {
-    let prev = PREV_FOREGROUND.load(Ordering::Relaxed) as HWND;
-    if !prev.is_null() {
-        unsafe { SetForegroundWindow(prev) };
+/// Show the clipboard window above Explorer without activating it. This keeps an inline rename
+/// edit alive; Tauri's visibility state remains hidden so the normal activating path can be used
+/// on the next session after set_focusable(true).
+pub fn show_no_activate(hwnd: HWND) -> bool {
+    if unsafe { IsWindow(hwnd) } == 0 {
+        return false;
     }
-    thread::sleep(Duration::from_millis(80));
+    unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+    unsafe { IsWindowVisible(hwnd) != 0 }
+}
+
+pub fn hide_no_activate(hwnd: HWND) {
+    if unsafe { IsWindow(hwnd) } != 0 {
+        unsafe { ShowWindow(hwnd, SW_HIDE) };
+    }
+}
+
+pub fn send_paste() -> bool {
     send_keys(&[
         (VK_CONTROL, false),
         (VK_V, false),
         (VK_V, true),
         (VK_CONTROL, true),
-    ]);
+    ])
 }
 
 fn send_keys<const N: usize>(keys: &[(u16, bool); N]) -> bool {
