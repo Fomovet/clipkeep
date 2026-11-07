@@ -52,6 +52,9 @@ static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// The Explorer rename session uses a raw SW_SHOWNOACTIVATE show and therefore must also use
 /// the matching raw hide; Tauri's runtime visibility flag intentionally stays false in this mode.
 static NOACTIVATE_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// The current UI is in non-focus-stealing mode, including when an already-visible pinned panel
+/// protects an Explorer rename editor.
+static PRESERVE_EDITOR_MODE: AtomicBool = AtomicBool::new(false);
 /// Ignore a transient blur while WebView2 is being shown, then check real focus.
 static TRAY_MENU_VISIBLE: AtomicBool = AtomicBool::new(false);
 static TRAY_MENU_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -522,7 +525,9 @@ fn return_to_input(
 ) -> CmdResult<()> {
     // Ignore foreground transitions caused by restoring focus and injecting this paste.
     let _returning = focus::Returning::new();
-    let hide_after = !keep_open || focus::preserves_editor(action);
+    // A pinned panel stays visible after every paste. Explorer's rename mode is nonfocusable, so
+    // preserving that editor does not require hiding the pinned panel.
+    let hide_after = !keep_open;
     let (send, recv) = std::sync::mpsc::sync_channel(1);
     let handle = app.clone();
     app.run_on_main_thread(move || {
@@ -606,7 +611,7 @@ async fn hide_window(app: AppHandle) -> CmdResult<()> {
 }
 #[tauri::command]
 fn get_rename_safe_mode() -> bool {
-    NOACTIVATE_VISIBLE.load(Ordering::Relaxed)
+    PRESERVE_EDITOR_MODE.load(Ordering::Relaxed)
 }
 
 /// Opens the download page in the user's browser. A link inside the WebView would navigate the
@@ -1655,6 +1660,7 @@ fn hide_main_window(app: &AppHandle) {
     DRAG_HIDE_UNTIL.store(0, Ordering::Relaxed);
     WINDOW_VISIBLE.store(false, Ordering::Relaxed);
     let no_activate = NOACTIVATE_VISIBLE.swap(false, Ordering::Relaxed);
+    PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
     if let Some(w) = main_window(app) {
         let _ = w.emit("window-hidden", ());
         let hide_result = if no_activate {
@@ -1700,9 +1706,11 @@ fn show_main(app: &AppHandle) {
             return;
         };
         NOACTIVATE_VISIBLE.store(true, Ordering::Relaxed);
+        PRESERVE_EDITOR_MODE.store(true, Ordering::Relaxed);
         WINDOW_VISIBLE.store(true, Ordering::Relaxed);
         if !win::show_no_activate(hwnd.0 as _) {
             NOACTIVATE_VISIBLE.store(false, Ordering::Relaxed);
+            PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
             WINDOW_VISIBLE.store(false, Ordering::Relaxed);
             focus::cancel();
             win::log_diagnostic("show-main-noactivate-failed");
@@ -1710,6 +1718,7 @@ fn show_main(app: &AppHandle) {
         }
     } else {
         NOACTIVATE_VISIBLE.store(false, Ordering::Relaxed);
+        PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
         if let Err(e) = w.set_focusable(true) {
             focus::cancel();
             win::log_diagnostic(&format!("set-focusable-failed {e}"));
@@ -1739,19 +1748,40 @@ fn watch_preserved_editor(app: &AppHandle) {
     std::thread::spawn(move || {
         loop {
             if !WINDOW_VISIBLE.load(Ordering::Relaxed)
-                || !NOACTIVATE_VISIBLE.load(Ordering::Relaxed)
+                || !PRESERVE_EDITOR_MODE.load(Ordering::Relaxed)
             {
                 return;
             }
             if !focus::preserved_editor_active() {
+                // Follow the new destination. If it is another Explorer rename edit, keep
+                // protecting it; otherwise a pinned panel can return to normal interaction.
+                if focus::foreground_changed() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
                 let handle = app.clone();
                 let _ = app.run_on_main_thread(move || {
                     if WINDOW_VISIBLE.load(Ordering::Relaxed)
-                        && NOACTIVATE_VISIBLE.load(Ordering::Relaxed)
+                        && PRESERVE_EDITOR_MODE.load(Ordering::Relaxed)
                         && !focus::preserved_editor_active()
                     {
-                        win::log_diagnostic("preserved-editor-dismissed");
-                        hide_main(&handle);
+                        let pinned = handle
+                            .try_state::<Core>()
+                            .is_some_and(|core| core.settings().keep_on_blur);
+                        if pinned {
+                            if let Some(window) = main_window(&handle) {
+                                if let Err(error) = window.set_focusable(true) {
+                                    win::log_diagnostic(&format!("set-focusable-failed {error}"));
+                                    return;
+                                }
+                                PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
+                                let _ = window.emit("rename-safe-mode-changed", false);
+                                win::log_diagnostic("preserved-editor-released-pinned");
+                            }
+                        } else {
+                            win::log_diagnostic("preserved-editor-dismissed");
+                            hide_main(&handle);
+                        }
                     }
                 });
                 return;
@@ -1831,7 +1861,7 @@ fn should_keep_open(app: &AppHandle) -> bool {
 }
 
 fn on_main_focus_changed(app: &AppHandle, focused: bool) {
-    if NOACTIVATE_VISIBLE.load(Ordering::Relaxed) {
+    if PRESERVE_EDITOR_MODE.load(Ordering::Relaxed) {
         return;
     }
     let epoch = FOCUS_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1848,14 +1878,23 @@ fn on_main_focus_changed(app: &AppHandle, focused: bool) {
         return;
     }
     // Keep the destination current while pinned. If the newly focused window is an Explorer
-    // rename edit, dismiss the panel so it cannot cover or steal that editor's input.
+    // rename edit, make the visible panel nonfocusable instead of dismissing the pinned window.
     if focus::external_foreground() {
         let pinned = app
             .try_state::<Core>()
             .is_some_and(|core| core.settings().keep_on_blur);
         if pinned {
             if focus::foreground_changed() {
-                hide_main(app);
+                if let Some(window) = main_window(app) {
+                    if let Err(error) = window.set_focusable(false) {
+                        win::log_diagnostic(&format!("set-nonfocusable-failed {error}"));
+                        hide_main(app);
+                        return;
+                    }
+                    PRESERVE_EDITOR_MODE.store(true, Ordering::Relaxed);
+                    let _ = window.emit("rename-safe-mode-changed", true);
+                    watch_preserved_editor(app);
+                }
                 return;
             }
         } else {

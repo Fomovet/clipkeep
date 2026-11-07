@@ -842,6 +842,9 @@ onMounted(async () => {
     await listen("groups-changed", reloadGroups),
     await listen<boolean>("window-shown", (e) => onShown(e.payload)),
     await listen("window-hidden", onHidden),
+    await listen<boolean>("rename-safe-mode-changed", (e) => {
+      preserveExplorerRename.value = e.payload;
+    }),
     await listen<string>("focus-error", (e) => reportFocusError(e.payload)),
     // Arrives after window-shown, whose reset to the list page it then overrides.
     await listen("open-about", () => openSettings(true)),
