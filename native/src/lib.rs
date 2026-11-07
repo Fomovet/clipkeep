@@ -447,12 +447,7 @@ fn reorder_groups(app: AppHandle, core: State<Core>, ids: Vec<i64>) -> CmdResult
 /// Reads the stored item and puts it on the clipboard. Image decoding happens before the lock is
 /// taken so a large image never blocks other DB users. `to_top` moves the item to the top of
 /// the list as most recently used.
-fn put_on_clipboard(
-    core: &Core,
-    id: i64,
-    to_top: bool,
-    action: focus::Action,
-) -> CmdResult<()> {
+fn put_on_clipboard(core: &Core, id: i64, to_top: bool, action: focus::Action) -> CmdResult<()> {
     let (kind, content) = db::get(&*core.conn()?, id)
         .map_err(to_err)?
         .ok_or("条目不存在")?;

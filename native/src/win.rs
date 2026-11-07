@@ -17,9 +17,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_LMENU, VK_LWIN, VK_MENU, VK_OEM_3, VK_RMENU, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
-    GetWindowThreadProcessId, HC_ACTION, HHOOK, IsHungAppWindow, IsWindow, IsWindowVisible,
-    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, EVENT_SYSTEM_FOREGROUND, OBJID_WINDOW, SW_HIDE,
+    BringWindowToTop, CallNextHookEx, DispatchMessageW, EVENT_SYSTEM_FOREGROUND,
+    GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HC_ACTION, HHOOK, IsHungAppWindow,
+    IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, OBJID_WINDOW, SW_HIDE,
     SW_SHOWNOACTIVATE, SetForegroundWindow, SetTimer, SetWindowsHookExW, ShowWindow,
     TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
