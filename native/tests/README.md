@@ -18,7 +18,7 @@ python native/tests/focus_regression.py --probe native/target/debug/examples/foc
 python ui/tests/focus_ipc_smoke.py
 ```
 
-`focus_regression.py` 直接引用生产 `focus.rs` 和 `win.rs`：两个 EDIT 各粘贴 20 次，浏览器 input、textarea、contenteditable 各 20 次，验证原光标、控件隔离、500ms 修饰键超时、释放等待、外部切换、旧会话、控件销毁和窗口关闭。`focus_ipc_smoke.py` 使用官方 Tauri mock 验证前端并发与提示，不代表原生验收。
+`focus_regression.py` 直接引用生产 `focus.rs` 和 `win.rs`：两个 EDIT 各粘贴 20 次，浏览器 input、textarea、contenteditable 各 20 次，另验证固定面板在同一窗口切换输入框后的 4 次连续粘贴；覆盖原光标、控件隔离、500ms 修饰键超时、释放等待、外部切换、旧会话、控件销毁和窗口关闭。`focus_ipc_smoke.py` 使用官方 Tauri mock 验证前端并发与提示，不代表原生验收。
 
 完整 Tauri 验收需要独立标识和数据目录。以下配置只用于测试，不能用于交付：
 

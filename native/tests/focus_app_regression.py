@@ -92,6 +92,29 @@ def run(probe_path, out):
             restored(1)
             checks.append("external-click-hide-keeps-new-control")
 
+            # Repeated clicks in a pinned panel must follow the latest native child
+            # control even when the foreground top-level window does not change.
+            show(0)
+            page.get_by_placeholder("搜索文本…").fill(marker)
+            expect(page.get_by_text(marker, exact=True)).to_be_visible()
+            assert page.evaluate('async () => (await import("/src/api.ts")).api.toggleKeepOnBlur()')
+            try:
+                hidden = page.evaluate("qaHides")
+                for index in (0, 1, 0, 1):
+                    fixture.call("focus", index=index)
+                    before = fixture.call("text")
+                    # Allow out-of-context WinEvents to arrive on the tracking thread.
+                    time.sleep(.1)
+                    page.get_by_text(marker, exact=True).click()
+                    restored(index)
+                    after = wait_text(fixture, index, "左" + marker + "右")
+                    assert after[1-index] == before[1-index]
+                    assert page.evaluate("qaHides") == hidden
+                checks.append("pinned-panel-follows-native-controls-without-hiding")
+            finally:
+                page.evaluate('async () => (await import("/src/api.ts")).api.toggleKeepOnBlur()')
+                page.evaluate('async () => (await import("/src/api.ts")).api.hideWindow()')
+
             # A 4096×4096 clipboard image exercises real image preparation on the worker.
             clipboard.call("image")
             deadline = time.monotonic() + 15

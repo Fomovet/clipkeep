@@ -11,18 +11,19 @@ use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM
 use windows_sys::Win32::Globalization::{CP_OEMCP, MultiByteToWideChar};
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
+use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
     VK_CONTROL, VK_LMENU, VK_LWIN, VK_MENU, VK_OEM_3, VK_RMENU, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CallNextHookEx, DispatchMessageW, EVENT_SYSTEM_FOREGROUND,
-    GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HC_ACTION, HHOOK, IsHungAppWindow,
-    IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, OBJID_WINDOW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SetForegroundWindow, SetTimer, SetWindowsHookExW, ShowWindow,
-    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    BringWindowToTop, CallNextHookEx, DispatchMessageW, EVENT_OBJECT_FOCUS,
+    EVENT_SYSTEM_FOREGROUND, GA_ROOT, GetAncestor, GetForegroundWindow, GetMessageW,
+    GetWindowThreadProcessId, HC_ACTION, HHOOK, IsHungAppWindow, IsWindow, IsWindowVisible,
+    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, OBJID_WINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SetForegroundWindow, SetTimer, SetWindowsHookExW, ShowWindow, TranslateMessage,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
 };
 
 const VK_V: u16 = 0x56;
@@ -462,24 +463,56 @@ pub fn start_foreground_tracking() {
             ));
             return;
         }
+        // A pinned panel can paste repeatedly while the user tabs between controls in the
+        // same foreground window. Foreground events alone leave the old child HWND cached.
+        let focus_hook = SetWinEventHook(
+            EVENT_OBJECT_FOCUS,
+            EVENT_OBJECT_FOCUS,
+            null_mut(),
+            Some(on_foreground_changed),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        if focus_hook.is_null() {
+            log_diagnostic(&format!(
+                "control-focus-tracking-failed error={}",
+                GetLastError()
+            ));
+        }
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        if !focus_hook.is_null() {
+            UnhookWinEvent(focus_hook);
+        }
+        UnhookWinEvent(hook);
     });
 }
 
 unsafe extern "system" fn on_foreground_changed(
     _hook: HWINEVENTHOOK,
-    _event: u32,
+    event: u32,
     hwnd: HWND,
     id_object: i32,
     _id_child: i32,
     _thread: u32,
     _time: u32,
 ) {
-    if id_object == OBJID_WINDOW && !hwnd.is_null() {
+    if hwnd.is_null() {
+        return;
+    }
+    // Ignore queued events from a window that has already lost the foreground. In
+    // particular, a late external focus event must not erase the target after we activate.
+    let foreground = unsafe { GetForegroundWindow() };
+    let relevant = match event {
+        EVENT_SYSTEM_FOREGROUND => id_object == OBJID_WINDOW && hwnd == foreground,
+        EVENT_OBJECT_FOCUS => (unsafe { GetAncestor(hwnd, GA_ROOT) }) == foreground,
+        _ => false,
+    };
+    if relevant {
         crate::focus::foreground_changed();
     }
 }

@@ -97,6 +97,20 @@ fn execute(value: Value) -> Result<Value, String> {
         let window = state.window as HWND;
         let command = value["cmd"].as_str().ok_or("missing command")?;
         match command {
+            "track" => {
+                win::start_foreground_tracking();
+                Ok(json!(true))
+            }
+            "claim" => {
+                state.action = Some(focus::claim()?);
+                Ok(json!(true))
+            }
+            "tracked-control" => {
+                let action = focus::claim()?;
+                let focused = focus::target_focused(action);
+                focus::finish(action);
+                focused.map(|ready| json!(ready))
+            }
             "focus" => {
                 let index = value["index"].as_u64().unwrap_or(0) as usize;
                 let field = *state.fields.get(index).ok_or("missing field")? as HWND;
@@ -175,13 +189,13 @@ fn execute(value: Value) -> Result<Value, String> {
             }
             "return" => {
                 let action = state.action.ok_or("missing action")?;
-                let result = {
-                    let _returning = focus::Returning::new();
-                    focus::restore(action)
-                };
+                let _returning = focus::Returning::new();
+                let result = focus::restore(action);
                 if result.is_ok() {
-                    unsafe {
-                        ShowWindow(window, SW_HIDE);
+                    if !value["keep_open"].as_bool().unwrap_or(false) {
+                        unsafe {
+                            ShowWindow(window, SW_HIDE);
+                        }
                     }
                     focus::wait_ready(action, value["paste"].as_bool().unwrap_or(false))
                         .map_err(|error| format!("{error}: {}", focus::diagnostic(action)))?;

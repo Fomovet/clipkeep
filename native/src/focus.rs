@@ -43,6 +43,14 @@ impl Session {
         self.busy = false;
     }
 
+    fn refresh(&mut self, target: Option<Target>) {
+        // Activation and child-focus events often describe the same destination. Such
+        // duplicates must not release the busy guard or cancel an in-flight transfer.
+        if self.target != target {
+            self.reset(target);
+        }
+    }
+
     fn claim(&mut self) -> Result<Action, String> {
         if self.busy {
             return Err("正在处理上一条记录".into());
@@ -220,10 +228,10 @@ pub fn preserves_editor(action: Action) -> bool {
     action.target.is_some_and(|target| target.preserve_editor)
 }
 
-/// Refresh the destination when a pinned panel remains open and the user activates another app.
+/// Refresh the destination when the user activates another app or changes its focused control.
 /// The paste worker owns focus while it restores and injects input, so ignore those transitions.
 pub fn foreground_changed() -> bool {
-    if is_returning() {
+    if is_returning() || owns_foreground() {
         return false;
     }
     let target = capture();
@@ -231,7 +239,7 @@ pub fn foreground_changed() -> bool {
     if let Ok(mut session) = SESSION.lock()
         && !is_returning()
     {
-        session.reset(target);
+        session.refresh(target);
     }
     preserve_editor
 }
@@ -472,6 +480,25 @@ mod tests {
         session.reset(Some(target()));
         session.reset(None);
         assert!(session.claim().unwrap().target.is_none());
+    }
+
+    #[test]
+    fn duplicate_focus_events_preserve_busy_action_but_new_control_invalidates_it() {
+        let mut session = Session::default();
+        session.reset(Some(target()));
+        let old = session.claim().unwrap();
+        session.refresh(Some(target()));
+        assert_eq!(session.generation, old.generation);
+        assert!(session.claim().is_err());
+
+        let next_control = Target {
+            control: 5,
+            ..target()
+        };
+        session.refresh(Some(next_control));
+        let next = session.claim().unwrap();
+        assert_ne!(next.generation, old.generation);
+        assert_eq!(next.target, Some(next_control));
     }
 
     #[test]

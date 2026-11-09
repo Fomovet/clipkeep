@@ -192,13 +192,36 @@ def run(probe_path, out):
         result = probe.request("return", paste=True)
         assert not result["ok"] and "窗口已关闭" in result["error"], result
         passed.append("closed-window-rejected")
+
+        # Keep the panel visible and follow child focus changes within the same foreground
+        # window. Each return must use the latest control, without starting a new session.
+        fixture = Probe(probe_path, "--target")
+        probe.call("track")
+        fixture.call("focus", index=0)
+        probe.call("capture")
+        probe.call("show")
+        probe.call("return", paste=True, keep_open=True)
+        wait_text(fixture, 0, "左" + marker + "右")
+        for index in (1, 0, 1):
+            fixture.call("focus", index=index)
+            before = fixture.call("text")
+            deadline = time.monotonic() + 2
+            while not probe.call("tracked-control"):
+                assert time.monotonic() < deadline, "Child focus change was not tracked"
+                time.sleep(.01)
+            probe.call("show")
+            probe.call("claim")
+            probe.call("return", paste=True, keep_open=True)
+            after = wait_text(fixture, index, "左" + marker + "右")
+            assert after[1-index] == before[1-index], "Paste changed the previous control"
+        passed.append("pinned-panel-follows-controls-within-same-foreground-window")
     finally:
         try:
             probe.call("restore-clipboard")
         finally:
             fixture.close()
             probe.close()
-    report = {"result": "PASS", "nativePasteCycles": 40, "browserPasteCycles": 60, "checks": passed}
+    report = {"result": "PASS", "nativePasteCycles": 44, "browserPasteCycles": 60, "checks": passed}
     (out / "focus-regression.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False))
 
