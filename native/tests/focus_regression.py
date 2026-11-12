@@ -1,6 +1,6 @@
 """Real Windows focus/SendInput regression using disposable native and Chromium windows.
 
-Build: cargo build --example focus_probe
+Build: cargo build --example focus_probe --features focus-probe
 Run: python native/tests/focus_regression.py --probe <focus_probe.exe>
 Requires playwright (`python -m playwright install chromium`). No user browser profile is used.
 """

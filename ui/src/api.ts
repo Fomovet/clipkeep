@@ -30,6 +30,7 @@ export interface Settings {
   hotkey: string;
   captureImages: boolean;
   rememberPosition: boolean;
+  hideDockIcon: boolean;
   keepOnBlur: boolean;
   windowX: number | null;
   windowY: number | null;
@@ -43,6 +44,7 @@ export type Theme = "system" | "light" | "dark";
 
 export interface SettingsView {
   settings: Settings;
+  supportsDockVisibility: boolean;
   hotkeys: { id: string; label: string }[];
   dataDir: string;
 }

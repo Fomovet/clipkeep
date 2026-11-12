@@ -24,7 +24,6 @@ tauri-plugin-single-instance = "2.5.3"
 arboard = "3.6.1"
 clipboard-master = "4.0.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 blake3 = "1.5"
 tauri-plugin-dialog = "2.8.2"
@@ -32,12 +31,38 @@ base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 getrandom = "0.4.3"
 local-ip-address = "0.6.13"
-# Update check/download. Same reqwest as Tauri; Schannel TLS and the Windows proxy settings.
+# Update check/download. Same reqwest as Tauri; Schannel/Security framework TLS and the
+# operating system's proxy settings.
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "system-proxy"] }
 sha2 = "0.10.9"
-# Same versions Tauri uses; only for WebView2 interfaces it doesn't wrap.
+
+# Windows-only: the Win32 implementation and the WebView2 interfaces Tauri doesn't wrap.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory"] }
 webview2-com = "0.39.1"
 windows-core = "0.62.2"
+
+# macOS-only: Carbon global hotkeys, CGEvent paste, and NSPasteboard/NSWorkspace helpers.
+# Versions match the ones Tauri already brings in on macOS, so no duplicate builds.
+[target.'cfg(target_os = "macos")'.dependencies]
+global-hotkey = "0.7.0"
+core-graphics = "0.25.0"
+core-foundation = "0.10.1"
+objc2 = "0.6.5"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+libc = "0.2"
+
+[features]
+# The interactive focus probe is a Win32-only fixture (it includes src/win.rs and src/focus.rs).
+# Gate it so Apple Silicon builds of every target succeed; Windows regression runs opt in with
+# `cargo build --example focus_probe --features focus-probe`.
+focus-probe = []
+
+[[example]]
+name = "focus_probe"
+required-features = ["focus-probe"]
+
 [profile.release]
 codegen-units = 1
 # Fat LTO ("true") crashes rustc 1.99 here with STATUS_ACCESS_VIOLATION; thin is nearly as small.

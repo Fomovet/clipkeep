@@ -1,13 +1,36 @@
 mod atomic_file;
-mod clipboard;
 mod db;
-mod dib;
+// Windows uses the Win32 focus tracker; macOS supplies a session-compatible implementation
+// built on NSWorkspace/NSRunningApplication so the v0.2.4 return-to-input flow is shared.
+#[cfg(windows)]
+mod focus;
+#[cfg(target_os = "macos")]
+#[path = "macos/focus.rs"]
 mod focus;
 mod images;
-mod instances;
 mod lan;
 mod settings;
 mod update;
+
+// Platform modules keep the same names so every call site below stays unchanged: the macOS
+// files provide the same public surface as their Win32 counterparts.
+#[cfg(windows)]
+mod clipboard;
+#[cfg(windows)]
+mod dib;
+#[cfg(windows)]
+mod instances;
+#[cfg(windows)]
+mod win;
+
+#[cfg(target_os = "macos")]
+#[path = "macos/clipboard.rs"]
+mod clipboard;
+#[cfg(target_os = "macos")]
+#[path = "macos/instances.rs"]
+mod instances;
+#[cfg(target_os = "macos")]
+#[path = "macos/win.rs"]
 mod win;
 
 use base64::Engine as _;
@@ -20,20 +43,28 @@ use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsFile};
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
+#[cfg(windows)]
+use std::process::Output;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock};
+#[cfg(target_os = "macos")]
+use tauri::LogicalPosition;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::DialogExt;
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const AUTOSTART_ARG: &str = "--minimized";
+#[cfg(windows)]
 const AUTOSTART_TASK: &str = "\\clipkeep-clipboard";
 /// Written next to the exe by the installer on a first install (see installer-hooks.nsh).
+#[cfg(windows)]
 const AUTOSTART_MARKER: &str = "autostart.pending";
 const BUNDLE_VERSION: u32 = 1;
 const MAX_IMPORT_FILE: u64 = 2 * 1024 * 1024 * 1024;
@@ -506,14 +537,58 @@ fn paste_file_name(source: Option<&str>) -> String {
                 && !RESERVED.contains(&upper.as_str())
                 && !((upper.starts_with("COM") || upper.starts_with("LPT")) && upper.len() == 4)
         });
-    let stem = stem.unwrap_or_else(|| {
-        let t = local_time();
-        format!(
-            "clipkeep_{:04}{:02}{:02}_{:02}{:02}{:02}",
-            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
-        )
-    });
+    let stem = stem.unwrap_or_else(|| format!("clipkeep_{}", local_timestamp()));
     format!("{stem}.png")
+}
+
+/// Wall-clock time as plain integers, so both the Win32 `SYSTEMTIME` and the macOS
+/// `localtime_r` backends feed the same formatting helpers.
+struct LocalTime {
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    second: i32,
+}
+
+#[cfg(windows)]
+fn local_time() -> LocalTime {
+    let mut t = windows_sys::Win32::Foundation::SYSTEMTIME::default();
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
+    LocalTime {
+        year: t.wYear as i32,
+        month: t.wMonth as i32,
+        day: t.wDay as i32,
+        hour: t.wHour as i32,
+        minute: t.wMinute as i32,
+        second: t.wSecond as i32,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn local_time() -> LocalTime {
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        LocalTime {
+            year: tm.tm_year + 1900,
+            month: tm.tm_mon + 1,
+            day: tm.tm_mday,
+            hour: tm.tm_hour,
+            minute: tm.tm_min,
+            second: tm.tm_sec,
+        }
+    }
+}
+
+fn local_timestamp() -> String {
+    let t = local_time();
+    format!(
+        "{:04}{:02}{:02}_{:02}{:02}{:02}",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
 }
 
 /// Worker thread: keep image work and the bounded focus/modifier wait off the UI thread.
@@ -525,6 +600,12 @@ fn return_to_input(
 ) -> CmdResult<()> {
     // Ignore foreground transitions caused by restoring focus and injecting this paste.
     let _returning = focus::Returning::new();
+    #[cfg(target_os = "macos")]
+    if paste && !win::can_send_paste() {
+        return Err(
+            "请在系统设置 → 隐私与安全性 → 辅助功能中允许 clipkeep 控制电脑，内容已复制".into(),
+        );
+    }
     // A pinned panel stays visible after every paste. Explorer's rename mode is nonfocusable, so
     // preserving that editor does not require hiding the pinned panel.
     let hide_after = !keep_open;
@@ -536,6 +617,10 @@ fn return_to_input(
             return;
         }
         let restored = focus::restore(action);
+        win::log_diagnostic(&format!(
+            "restore-input result={restored:?} {}",
+            focus::diagnostic(action)
+        ));
         // A failed paste remains actionable if we still own the popup. Dismissals must
         // always close, including when the old application has already exited.
         if hide_after && (restored.is_ok() || !paste || !focus::owns_foreground()) {
@@ -616,9 +701,20 @@ fn get_rename_safe_mode() -> bool {
 
 /// Opens the download page in the user's browser. A link inside the WebView would navigate the
 /// app's own window away; going through Explorer also keeps the browser out of our elevation.
+#[cfg(windows)]
 #[tauri::command]
 fn open_release_page() -> CmdResult<()> {
     Command::new("explorer.exe")
+        .arg(update::RELEASES_PAGE)
+        .spawn()
+        .map(drop)
+        .map_err(to_err)
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn open_release_page() -> CmdResult<()> {
+    Command::new("open")
         .arg(update::RELEASES_PAGE)
         .spawn()
         .map(drop)
@@ -677,16 +773,19 @@ fn toggle_keep_on_blur(app: AppHandle, core: State<Core>) -> CmdResult<bool> {
     Ok(s.keep_on_blur)
 }
 
+#[cfg(windows)]
 #[tauri::command]
 fn get_autostart(app: AppHandle) -> CmdResult<bool> {
     Ok(autostart_task_exists() || app.autolaunch().is_enabled().unwrap_or(false))
 }
 
+#[cfg(windows)]
 #[tauri::command]
 fn set_autostart(app: AppHandle, enabled: bool) -> CmdResult<bool> {
     apply_autostart(&app, enabled)
 }
 
+#[cfg(windows)]
 fn run_schtasks(args: &[&str]) -> CmdResult<Output> {
     Command::new("schtasks.exe")
         .args(args)
@@ -695,14 +794,17 @@ fn run_schtasks(args: &[&str]) -> CmdResult<Output> {
         .map_err(to_err)
 }
 
+#[cfg(windows)]
 fn autostart_task_exists() -> bool {
     run_schtasks(&["/Query", "/TN", AUTOSTART_TASK]).is_ok_and(|output| output.status.success())
 }
 
+#[cfg(windows)]
 fn schtasks_error(output: &Output) -> String {
     win::oem_to_string(&output.stderr).trim().to_owned()
 }
 
+#[cfg(windows)]
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -712,11 +814,13 @@ fn xml_escape(text: &str) -> String {
 
 /// Stored in the task's description; bump it when the definition changes so older tasks get
 /// rewritten on startup.
+#[cfg(windows)]
 const AUTOSTART_TASK_VERSION: &str = "clipkeep-autostart-v2";
 
 /// `schtasks /SC ONLOGON` gets several defaults wrong for a resident app: it fires on any user's
 /// logon, won't start on battery, stops when unplugged, kills the process after 72 hours and runs
 /// it at below-normal priority. Spell every one of them out.
+#[cfg(windows)]
 fn autostart_task_xml(executable: &str, user: &str) -> String {
     let (exe, user) = (xml_escape(executable), xml_escape(user));
     format!(
@@ -760,6 +864,7 @@ fn autostart_task_xml(executable: &str, user: &str) -> String {
     )
 }
 
+#[cfg(windows)]
 fn create_autostart_task() -> CmdResult<()> {
     if cfg!(debug_assertions) {
         return Err("请使用发布版设置开机自启".into());
@@ -798,6 +903,7 @@ fn create_autostart_task() -> CmdResult<()> {
 /// Keeps the logon task current: rewrites one an older version of this exe created, and takes
 /// one over from an older copy elsewhere, e.g. the single-file build an installer upgrade left
 /// behind. A task for a newer copy is left alone.
+#[cfg(windows)]
 fn upgrade_autostart_task() {
     let Ok(output) = run_schtasks(&["/Query", "/TN", AUTOSTART_TASK, "/XML"]) else {
         return;
@@ -820,6 +926,7 @@ fn upgrade_autostart_task() {
 }
 
 /// The program a scheduled task starts, from its XML definition.
+#[cfg(windows)]
 fn task_command(xml: &str) -> Option<PathBuf> {
     let start = xml.find("<Command>")? + "<Command>".len();
     let end = start + xml[start..].find("</Command>")?;
@@ -832,6 +939,7 @@ fn task_command(xml: &str) -> Option<PathBuf> {
     Some(PathBuf::from(command.trim().trim_matches('"')))
 }
 
+#[cfg(windows)]
 fn delete_autostart_task() -> CmdResult<()> {
     if autostart_task_exists() {
         let output = run_schtasks(&["/Delete", "/TN", AUTOSTART_TASK, "/F"])?;
@@ -842,6 +950,7 @@ fn delete_autostart_task() -> CmdResult<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn apply_autostart(app: &AppHandle, enabled: bool) -> CmdResult<bool> {
     let launcher = app.autolaunch();
     if enabled {
@@ -858,6 +967,33 @@ fn apply_autostart(app: &AppHandle, enabled: bool) -> CmdResult<bool> {
     Ok(now)
 }
 
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> CmdResult<bool> {
+    Ok(app.autolaunch().is_enabled().unwrap_or(false))
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> CmdResult<bool> {
+    apply_autostart(&app, enabled)
+}
+
+/// On macOS the LaunchAgent installed by `tauri-plugin-autostart` (MacosLauncher::LaunchAgent)
+/// is the only autostart entry; there is no elevated scheduled task to create or migrate.
+#[cfg(target_os = "macos")]
+fn apply_autostart(app: &AppHandle, enabled: bool) -> CmdResult<bool> {
+    let launcher = app.autolaunch();
+    if enabled {
+        launcher.enable().map_err(to_err)?;
+    } else {
+        launcher.disable().map_err(to_err)?;
+    }
+    let now = launcher.is_enabled().unwrap_or(false);
+    let _ = app.emit("autostart-changed", now);
+    Ok(now)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HotkeyOption {
@@ -869,6 +1005,7 @@ struct HotkeyOption {
 #[serde(rename_all = "camelCase")]
 struct SettingsView {
     settings: Settings,
+    supports_dock_visibility: bool,
     hotkeys: Vec<HotkeyOption>,
     data_dir: String,
 }
@@ -885,6 +1022,7 @@ struct StorageUsageView {
 fn get_settings(core: State<Core>) -> SettingsView {
     SettingsView {
         settings: core.settings(),
+        supports_dock_visibility: cfg!(target_os = "macos"),
         hotkeys: win::HOTKEYS
             .iter()
             .map(|&(id, _, _, label)| HotkeyOption { id, label })
@@ -925,7 +1063,15 @@ fn update_settings(app: AppHandle, core: State<Core>, settings: Settings) -> Cmd
     if win::hotkey_label(&new.hotkey).is_none() {
         return Err("未知的快捷键".into());
     }
-    core.settings_file.save(&new).map_err(to_err)?;
+    if new.hide_dock_icon != old.hide_dock_icon {
+        apply_dock_visibility(&app, new.hide_dock_icon).map_err(to_err)?;
+    }
+    if let Err(error) = core.settings_file.save(&new) {
+        if new.hide_dock_icon != old.hide_dock_icon {
+            let _ = apply_dock_visibility(&app, old.hide_dock_icon);
+        }
+        return Err(to_err(error));
+    }
     *current = new.clone();
     drop(current);
     win::set_hotkey(new.hotkey_enabled, &new.hotkey);
@@ -1166,19 +1312,12 @@ fn import_bundle(core: &Core, bundle: Bundle, written: &mut Vec<String>) -> CmdR
     Ok(count)
 }
 
-/// The wall-clock time the user sees, for file names.
-fn local_time() -> windows_sys::Win32::Foundation::SYSTEMTIME {
-    let mut t = windows_sys::Win32::Foundation::SYSTEMTIME::default();
-    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
-    t
-}
-
 /// Local time as YYYYMMDD-HHMMSS, for export and corrupt-database file names.
 fn chrono_stamp() -> String {
     let t = local_time();
     format!(
         "{:04}{:02}{:02}-{:02}{:02}{:02}",
-        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+        t.year, t.month, t.day, t.hour, t.minute, t.second
     )
 }
 
@@ -1277,9 +1416,12 @@ fn show_tray_menu(app: &AppHandle, cursor: PhysicalPosition<f64>) {
         TRAY_MENU_CREATING.store(false, Ordering::Relaxed);
         match built {
             Ok(window) => {
+                #[cfg(windows)]
                 if let Ok(hwnd) = window.hwnd() {
                     win::disable_transitions(hwnd.0 as _);
                 }
+                #[cfg(not(windows))]
+                let _ = &window;
             }
             Err(e) => {
                 TRAY_MENU_VISIBLE.store(false, Ordering::Relaxed);
@@ -1294,25 +1436,68 @@ fn reveal_tray_menu(app: &AppHandle, window: &WebviewWindow) {
     let Ok(size) = window.outer_size() else {
         return;
     };
+    #[cfg(windows)]
     let Some(pointer) = TRAY_MENU_POINTER.lock().ok().and_then(|slot| *slot) else {
         return;
     };
-    let mut x = pointer.x.round() as i32 + 6;
-    let mut y = pointer.y.round() as i32 + 6;
-    if let Ok(Some(monitor)) = app.monitor_from_point(pointer.x, pointer.y) {
-        let area = monitor.work_area();
-        let left = area.position.x;
-        let top = area.position.y;
-        let right = left + area.size.width as i32;
-        let bottom = top + area.size.height as i32;
-        x = popup_axis(pointer.x.round() as i32, size.width as i32, left, right);
-        y = popup_axis(pointer.y.round() as i32, size.height as i32, top, bottom);
+    #[cfg(target_os = "macos")]
+    if TRAY_MENU_POINTER
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .is_none()
+    {
+        return;
     }
-    let _ = window.set_position(PhysicalPosition::new(x, y));
+
+    #[cfg(windows)]
+    {
+        let mut x = pointer.x.round() as i32 + 6;
+        let mut y = pointer.y.round() as i32 + 6;
+        if let Ok(Some(monitor)) = app.monitor_from_point(pointer.x, pointer.y) {
+            let area = monitor.work_area();
+            let left = area.position.x;
+            let top = area.position.y;
+            let right = left + area.size.width as i32;
+            let bottom = top + area.size.height as i32;
+            x = popup_axis(pointer.x.round() as i32, size.width as i32, left, right);
+            y = popup_axis(pointer.y.round() as i32, size.height as i32, top, bottom);
+        }
+        let _ = window.set_position(PhysicalPosition::new(x, y));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        // tao's monitor lookup uses display points while cursor/work_area use scaled pixels,
+        // so on Retina it returns nothing and the menu would land off-screen. Use AppKit's
+        // visible frame (menu bar and Dock excluded) in the same space as LogicalPosition.
+        let pointer = win::cursor_point();
+        let area = win::popup_area(pointer);
+        let scale = area.scale;
+        let x = popup_axis(
+            pointer.0.round() as i32,
+            (size.width as f64 / scale).round() as i32,
+            area.left.round() as i32,
+            area.right.round() as i32,
+        );
+        let y = popup_axis(
+            pointer.1.round() as i32,
+            (size.height as f64 / scale).round() as i32,
+            area.top.round() as i32,
+            area.bottom.round() as i32,
+        );
+        let _ = window.set_position(LogicalPosition::new(x as f64, y as f64));
+    }
     // Windows can restore the native caption on this secondary window. Enforce the borderless
     // style immediately before every show.
     if let Err(e) = window.set_decorations(false) {
         win::log_diagnostic(&format!("style-tray-menu-failed {e}"));
+    }
+    #[cfg(target_os = "macos")]
+    if let Err(e) = win::prepare_popup(window) {
+        TRAY_MENU_VISIBLE.store(false, Ordering::Relaxed);
+        win::log_diagnostic(&format!("prepare-tray-menu-failed {e}"));
+        return;
     }
     if let Err(e) = window.show() {
         TRAY_MENU_VISIBLE.store(false, Ordering::Relaxed);
@@ -1477,7 +1662,7 @@ mod import_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod autostart_task_tests {
     use super::{AUTOSTART_TASK_VERSION, autostart_task_xml, paste_file_name, task_command};
     use std::path::PathBuf;
@@ -1527,6 +1712,22 @@ mod autostart_task_tests {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod paste_file_name_tests {
+    use super::paste_file_name;
+
+    #[test]
+    fn names_pasted_pictures_after_their_file_or_the_time() {
+        assert_eq!(paste_file_name(Some("设计稿 v2.jpg")), "设计稿 v2.png");
+        assert_eq!(paste_file_name(Some(r"a<b>:c?.png")), "abc.png");
+        let timed = paste_file_name(None);
+        assert!(timed.starts_with("clipkeep_") && timed.ends_with(".png"));
+        assert_eq!(timed.len(), "clipkeep_20261028_120301.png".len());
+        assert!(paste_file_name(Some("CON.png")).starts_with("clipkeep_"));
+        assert!(paste_file_name(Some("...")).starts_with("clipkeep_"));
+    }
+}
+
 #[cfg(test)]
 mod popup_position_tests {
     use super::popup_axis;
@@ -1537,6 +1738,54 @@ mod popup_position_tests {
         assert_eq!(popup_axis(95, 30, 0, 100), 59);
         assert_eq!(popup_axis(50, 30, 0, 100), 56);
         assert_eq!(popup_axis(10, 120, 0, 100), 0);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod popup_clamp_tests {
+    use super::clamp_popup;
+    use crate::win::PopupArea;
+
+    fn area() -> PopupArea {
+        PopupArea {
+            left: 100.0,
+            top: 200.0,
+            right: 1100.0,
+            bottom: 900.0,
+            scale: 2.0,
+        }
+    }
+
+    #[test]
+    fn follows_the_mouse_when_there_is_room() {
+        assert_eq!(
+            clamp_popup(400.0, 300.0, 400.0, 600.0, area()),
+            (400.0, 300.0)
+        );
+    }
+
+    #[test]
+    fn never_passes_the_visible_right_or_bottom_edge() {
+        assert_eq!(
+            clamp_popup(1090.0, 890.0, 400.0, 600.0, area()),
+            (700.0, 300.0)
+        );
+    }
+
+    #[test]
+    fn never_passes_the_visible_left_or_top_edge() {
+        assert_eq!(
+            clamp_popup(50.0, 100.0, 400.0, 600.0, area()),
+            (100.0, 200.0)
+        );
+    }
+
+    #[test]
+    fn a_window_larger_than_the_screen_stays_anchored_at_the_top_left() {
+        assert_eq!(
+            clamp_popup(900.0, 800.0, 2000.0, 1200.0, area()),
+            (100.0, 200.0)
+        );
     }
 }
 
@@ -1585,7 +1834,10 @@ fn tray_menu_action(app: AppHandle, action: String) -> CmdResult<()> {
             set_capture_paused(&app, !clipboard::capture_paused());
         }
         "autostart" => {
+            #[cfg(windows)]
             let enabled = autostart_task_exists() || app.autolaunch().is_enabled().unwrap_or(false);
+            #[cfg(target_os = "macos")]
+            let enabled = app.autolaunch().is_enabled().unwrap_or(false);
             apply_autostart(&app, !enabled)?;
         }
         "quit" => {
@@ -1608,6 +1860,7 @@ fn tray_menu_action(app: AppHandle, action: String) -> CmdResult<()> {
 }
 
 /// The panel is hidden most of the time; a low target lets WebView2 trim its renderer meanwhile.
+#[cfg(windows)]
 fn set_low_memory(window: &WebviewWindow, low: bool) {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
@@ -1630,6 +1883,10 @@ fn set_low_memory(window: &WebviewWindow, low: bool) {
         }
     });
 }
+
+/// WKWebView exposes no memory-usage target level; hiding the panel is already enough.
+#[cfg(target_os = "macos")]
+fn set_low_memory(_window: &WebviewWindow, _low: bool) {}
 
 fn hide_main(app: &AppHandle) {
     focus::cancel();
@@ -1664,9 +1921,17 @@ fn hide_main_window(app: &AppHandle) {
     if let Some(w) = main_window(app) {
         let _ = w.emit("window-hidden", ());
         let hide_result = if no_activate {
-            w.hwnd()
-                .map(|hwnd| win::hide_no_activate(hwnd.0 as _))
-                .map_err(to_err)
+            #[cfg(windows)]
+            {
+                w.hwnd()
+                    .map(|hwnd| win::hide_no_activate(hwnd.0 as _))
+                    .map_err(to_err)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                win::hide_no_activate(());
+                w.hide().map_err(to_err)
+            }
         } else {
             w.hide().map_err(to_err)
         };
@@ -1700,6 +1965,9 @@ fn show_main(app: &AppHandle) {
             win::log_diagnostic(&format!("set-nonfocusable-failed {error}"));
             return;
         }
+        // Only Windows has a native window handle and the non-activating show that keeps an
+        // Explorer rename editor alive. macOS never enters this branch: begin_session() is false.
+        #[cfg(windows)]
         let Ok(hwnd) = w.hwnd() else {
             focus::cancel();
             win::log_diagnostic("show-main-no-hwnd");
@@ -1708,7 +1976,11 @@ fn show_main(app: &AppHandle) {
         NOACTIVATE_VISIBLE.store(true, Ordering::Relaxed);
         PRESERVE_EDITOR_MODE.store(true, Ordering::Relaxed);
         WINDOW_VISIBLE.store(true, Ordering::Relaxed);
-        if !win::show_no_activate(hwnd.0 as _) {
+        #[cfg(windows)]
+        let shown = win::show_no_activate(hwnd.0 as _);
+        #[cfg(target_os = "macos")]
+        let shown = true;
+        if !shown {
             NOACTIVATE_VISIBLE.store(false, Ordering::Relaxed);
             PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
             WINDOW_VISIBLE.store(false, Ordering::Relaxed);
@@ -1725,15 +1997,23 @@ fn show_main(app: &AppHandle) {
             return;
         }
         let _ = w.unminimize();
+        #[cfg(target_os = "macos")]
+        if let Err(e) = win::prepare_popup(&w) {
+            win::log_diagnostic(&format!("prepare-main-failed {e}"));
+            return;
+        }
         if let Err(e) = w.show() {
             win::log_diagnostic(&format!("show-main-failed {e}"));
             eprintln!("show main window failed: {e}");
             return;
         }
         // show_main already runs on the main thread (dispatched by the hook dispatcher).
+        #[cfg(windows)]
         if let Ok(hwnd) = w.hwnd() {
             win::force_foreground(hwnd.0 as _);
         }
+        #[cfg(target_os = "macos")]
+        win::force_foreground();
         WINDOW_VISIBLE.store(true, Ordering::Relaxed);
     }
     win::log_diagnostic("show-main-complete");
@@ -1814,6 +2094,7 @@ fn place_window(app: &AppHandle, w: &WebviewWindow) {
     place_near_cursor(app, w);
 }
 
+#[cfg(windows)]
 fn place_near_cursor(app: &AppHandle, w: &WebviewWindow) {
     let (Ok(cursor), Ok(size)) = (app.cursor_position(), w.outer_size()) else {
         return;
@@ -1829,6 +2110,35 @@ fn place_near_cursor(app: &AppHandle, w: &WebviewWindow) {
         y = y.min(bottom - size.height as i32).max(top);
     }
     let _ = w.set_position(PhysicalPosition::new(x, y));
+}
+
+/// macOS keeps the same mouse anchor, but clamps against AppKit's visible frame. tao's
+/// `monitor_from_point()` uses plain display points while `cursor_position()`/`work_area()` are
+/// scaled pixels, so on Retina the lookup returns `None` and the old code skipped clamping.
+#[cfg(target_os = "macos")]
+fn place_near_cursor(_app: &AppHandle, w: &WebviewWindow) {
+    let Ok(size) = w.outer_size() else {
+        return;
+    };
+    let cursor = win::cursor_point();
+    let area = win::popup_area(cursor);
+    let (width, height) = (
+        size.width as f64 / area.scale,
+        size.height as f64 / area.scale,
+    );
+    let (x, y) = clamp_popup(cursor.0 + 4.0, cursor.1 + 4.0, width, height, area);
+    win::log_diagnostic(&format!(
+        "place-main cursor=({:.0},{:.0}) area=({:.0},{:.0},{:.0},{:.0}) size=({:.0},{:.0}) -> ({:.0},{:.0})",
+        cursor.0, cursor.1, area.left, area.top, area.right, area.bottom, width, height, x, y
+    ));
+    let _ = w.set_position(LogicalPosition::new(x, y));
+}
+
+#[cfg(target_os = "macos")]
+fn clamp_popup(x: f64, y: f64, width: f64, height: f64, area: win::PopupArea) -> (f64, f64) {
+    let max_x = (area.right - width).max(area.left);
+    let max_y = (area.bottom - height).max(area.top);
+    (x.clamp(area.left, max_x), y.clamp(area.top, max_y))
 }
 
 fn on_window_moved(app: &AppHandle, pos: PhysicalPosition<i32>) {
@@ -1934,6 +2244,18 @@ fn on_main_focus_changed(app: &AppHandle, focused: bool) {
     });
 }
 
+fn apply_dock_visibility(app: &AppHandle, hide: bool) -> tauri::Result<()> {
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(if hide {
+        tauri::ActivationPolicy::Accessory
+    } else {
+        tauri::ActivationPolicy::Regular
+    })?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, hide);
+    Ok(())
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let mut tray = TrayIconBuilder::with_id("main")
         .tooltip("clipkeep 剪贴板")
@@ -2023,6 +2345,7 @@ pub fn run() {
             }
             clipboard::set_capture_images(settings.capture_images);
 
+            #[cfg(windows)]
             if !cfg!(debug_assertions) && handle.autolaunch().is_enabled().unwrap_or(false) {
                 if let Err(e) = create_autostart_task() {
                     eprintln!("migrating autostart to elevated task failed: {e}");
@@ -2030,6 +2353,7 @@ pub fn run() {
                     eprintln!("removing legacy autostart entry failed: {e}");
                 }
             }
+            #[cfg(windows)]
             if let Ok(marker) =
                 std::env::current_exe().map(|exe| exe.with_file_name(AUTOSTART_MARKER))
                 && marker.exists()
@@ -2042,10 +2366,12 @@ pub fn run() {
                     Err(e) => eprintln!("enabling autostart after install failed: {e}"),
                 }
             }
+            #[cfg(windows)]
             if !cfg!(debug_assertions) {
                 // Two schtasks round trips; keep them off the startup path.
                 std::thread::spawn(upgrade_autostart_task);
             }
+            #[cfg(windows)]
             for window in [main_window(&handle), tray_menu_window(&handle)]
                 .into_iter()
                 .flatten()
@@ -2055,6 +2381,7 @@ pub fn run() {
                 }
             }
             build_tray(&handle)?;
+            apply_dock_visibility(&handle, settings.hide_dock_icon)?;
             if !cfg!(debug_assertions) && settings.check_update_on_start {
                 let h = handle.clone();
                 std::thread::spawn(move || {

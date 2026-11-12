@@ -7,11 +7,18 @@
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+#[cfg(windows)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+#[cfg(windows)]
+use std::io::Read;
+use std::io::Write;
+#[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,10 +123,35 @@ fn set_state(app: &AppHandle, state: State) {
 }
 
 /// The installer leaves an uninstaller next to the exe; a single-file copy has none.
+#[cfg(windows)]
 fn is_portable() -> bool {
     std::env::current_exe()
         .map(|exe| !exe.with_file_name("uninstall.exe").exists())
         .unwrap_or(true)
+}
+
+/// The macOS build is a plain .app: there is no elevated installer to run in place, so the
+/// release page is the only update path. `download()` bails out just as it does for a portable
+/// Windows copy, and the UI keeps offering the "open download page" button.
+#[cfg(target_os = "macos")]
+fn is_portable() -> bool {
+    true
+}
+
+/// Release asset suffix for the running platform.
+#[cfg(windows)]
+const ASSET_SUFFIX: &str = "_x64-setup.exe";
+#[cfg(target_os = "macos")]
+const ASSET_SUFFIX: &str = "_aarch64.dmg";
+
+#[cfg(windows)]
+fn installer_file_name(version: &str) -> String {
+    format!("clipkeep_{version}_x64-setup.exe")
+}
+
+#[cfg(target_os = "macos")]
+fn installer_file_name(version: &str) -> String {
+    format!("clipkeep_{version}_aarch64.dmg")
 }
 
 /// Compares dotted numeric versions ("0.10.0" > "0.9.3"); non-numeric parts count as 0.
@@ -142,7 +174,8 @@ pub fn newer(remote: &str, local: &str) -> bool {
     false
 }
 
-/// Uses the Windows proxy settings (system-proxy) and the Windows certificate store (Schannel).
+/// Uses the OS proxy settings (system-proxy) and the OS certificate store (Schannel on Windows,
+/// Security.framework on macOS).
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(concat!("clipkeep/", env!("CARGO_PKG_VERSION")))
@@ -180,7 +213,7 @@ async fn github_latest() -> Result<Release, String> {
         assets.iter().find(|a| {
             a["name"]
                 .as_str()
-                .is_some_and(|n| n.ends_with("_x64-setup.exe"))
+                .is_some_and(|n| n.ends_with(ASSET_SUFFIX))
         })
     });
     Ok(Release {
@@ -355,7 +388,7 @@ async fn fetch(app: &AppHandle, release: &Release) -> Result<PathBuf, Fetch> {
     // Old installers are never needed again.
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("clipkeep_{}_x64-setup.exe", release.version));
+    let path = dir.join(installer_file_name(&release.version));
     let partial = path.with_extension("part");
 
     let mut resp = client()?.get(url).send().await?.error_for_status()?;
@@ -405,6 +438,7 @@ async fn fetch(app: &AppHandle, release: &Release) -> Result<PathBuf, Fetch> {
 
 /// Starts the verified installer in passive mode; it closes clipkeep, upgrades in place and
 /// restarts it. The caller then exits.
+#[cfg(windows)]
 pub fn install() -> Result<(), String> {
     let (version, path, expected) = match INNER.lock() {
         Ok(g) => match (
@@ -450,19 +484,41 @@ pub fn install() -> Result<(), String> {
     Ok(())
 }
 
-/// The app icon at the size Windows draws in the notification area (16 px at 100 % scaling).
-/// The window icon is the 32 px one, which the tray shrinks; a badge drawn on that comes out
-/// a few blurry pixels wide.
+/// macOS has no in-place installer; `is_portable()` keeps `download()` from reaching Ready, so
+/// this is only a guard against a stale UI event.
+#[cfg(target_os = "macos")]
+pub fn install() -> Result<(), String> {
+    Err("请从发布页下载 .dmg 手动更新".into())
+}
+
+/// The app icon at the size the platform draws in the notification area (16 px at 100 %
+/// scaling on Windows). The window icon is the 32 px one, which the tray shrinks; a badge
+/// drawn on that comes out a few blurry pixels wide.
 pub fn tray_icon(app: &AppHandle) -> Option<Image<'static>> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
-    let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
-    if size > 0
-        && let Ok(icon) = Image::from_app_icon_resource(size as u32)
+    #[cfg(windows)]
     {
-        return Some(icon);
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+        let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
+        if size > 0
+            && let Ok(icon) = Image::from_app_icon_resource(size as u32)
+        {
+            return Some(icon);
+        }
     }
-    app.default_window_icon()
-        .map(|icon| icon.clone().to_owned())
+    app.default_window_icon().map(|icon| {
+        #[cfg(target_os = "macos")]
+        {
+            // Keep the logo's alpha mask (including antialiasing), with white artwork for
+            // the menu bar. Also used when refreshing the update badge, so it stays white.
+            let mut rgba = icon.rgba().to_vec();
+            for pixel in rgba.as_chunks_mut::<4>().0 {
+                pixel[..3].fill(255);
+            }
+            Image::new_owned(rgba, icon.width(), icon.height())
+        }
+        #[cfg(not(target_os = "macos"))]
+        icon.clone().to_owned()
+    })
 }
 
 /// Paints a red dot on the tray icon while a newer version is known.

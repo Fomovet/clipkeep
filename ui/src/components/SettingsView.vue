@@ -318,12 +318,19 @@ onUnmounted(() => {
         <div class="row">
           <div class="label">
             <div class="name">外观</div>
-            <div class="desc">跟随系统时随 Windows 浅色 / 深色自动切换。</div>
+            <div class="desc">跟随系统时随系统外观的浅色 / 深色自动切换。</div>
           </div>
           <div class="segmented" role="group" aria-label="外观">
             <button v-for="option in themeOptions" :key="option.id" type="button" :class="{ active: s.theme === option.id }" :aria-pressed="s.theme === option.id" @click="save({ theme: option.id })">{{ option.label }}</button>
           </div>
         </div>
+        <label v-if="view.supportsDockVisibility" class="row">
+          <div class="label">
+            <div class="name">在程序坞中隐藏图标</div>
+            <div class="desc">隐藏后仍可通过菜单栏图标或快捷键打开，立即生效。</div>
+          </div>
+          <input type="checkbox" class="switch" :checked="s.hideDockIcon" @change="save({ hideDockIcon: !s.hideDockIcon })" />
+        </label>
         <label class="row">
           <div class="label">
             <div class="name">开机自启</div>
@@ -422,7 +429,7 @@ onUnmounted(() => {
         <div v-if="lan.receiveEnabled" class="row lan-code-row">
           <div class="label">
             <div class="name">本机配对码</div>
-            <div class="desc">在另一台设备的 clipkeep 中添加；请通过可信方式传递。端口 45788，首次接收可能需要允许 Windows 防火墙访问。</div>
+            <div class="desc">在另一台设备的 clipkeep 中添加；请通过可信方式传递。端口 45788，首次接收可能需要在系统防火墙中允许访问。</div>
           </div>
           <div v-if="lan.localCodes.length" class="lan-addresses">
             <button v-for="item in lan.localCodes" :key="item.address" class="btn" @click="copyCode(item.address)">复制 {{ item.address }}</button>
@@ -453,7 +460,7 @@ onUnmounted(() => {
         <label class="row">
           <div class="label">
             <div class="name">全局快捷键{{ s.hotkeyEnabled ? `（${hotkeyLabel}）` : "" }}</div>
-            <div class="desc">Win+V 是 Windows 保留快捷键，可能与系统面板冲突；遇到冲突可选 Ctrl+Shift+V。clipkeep 不修改系统剪贴板设置；关闭快捷键后可从托盘打开。</div>
+            <div class="desc">默认快捷键可能被系统面板占用；遇到冲突可在下方改选其他组合。clipkeep 不修改系统剪贴板设置；关闭快捷键后可从托盘打开。在 macOS 上粘贴需要授予「辅助功能」权限。</div>
           </div>
           <input type="checkbox" class="switch" :checked="s.hotkeyEnabled" @change="save({ hotkeyEnabled: !s.hotkeyEnabled })" />
         </label>
