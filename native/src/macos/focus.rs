@@ -11,8 +11,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-pub const WAIT_LIMIT: Duration = Duration::from_millis(500);
+pub const WAIT_LIMIT: Duration = Duration::from_millis(1500);
 pub const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const INPUT_SETTLE: Duration = Duration::from_millis(80);
 pub const CANCELLED: &str = "操作已取消";
 
 /// One popup session. `Copy` because the shared flow passes it to several predicates.
@@ -189,15 +190,13 @@ pub fn restore(action: Action) -> Result<(), String> {
     let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
         return Err("原输入应用已退出".into());
     };
-    app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
-    let deadline = Instant::now() + WAIT_LIMIT;
-    while Instant::now() < deadline {
-        if frontmost_pid() == pid {
-            return Ok(());
-        }
-        std::thread::sleep(POLL_INTERVAL);
+    if !app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows) {
+        return Err("无法恢复原输入窗口".into());
     }
-    Err("无法恢复原输入窗口".into())
+    // Activation is asynchronous. Do not block the main run loop waiting for it: AppKit
+    // needs that loop to resign our key window and restore the full-screen input window.
+    // The worker's wait_ready below confirms activation before any key is sent.
+    Ok(())
 }
 
 pub fn target_focused(action: Action) -> Result<bool, String> {
@@ -223,12 +222,20 @@ pub fn diagnostic(action: Action) -> String {
 /// Wait for held modifiers to be released before injecting Cmd+V.
 pub fn wait_ready(action: Action, paste: bool) -> Result<(), String> {
     let deadline = Instant::now() + WAIT_LIMIT;
+    let mut focused_since = None;
     loop {
         if !current(action) {
             return Err(CANCELLED.into());
         }
         if target_focused(action)? && (!paste || crate::win::modifiers_released()) {
-            return Ok(());
+            let since = focused_since.get_or_insert_with(Instant::now);
+            // NSWorkspace can report the new PID before its key window/first responder
+            // accepts input. Require stable focus before synthesising Command-V.
+            if !paste || since.elapsed() >= INPUT_SETTLE {
+                return Ok(());
+            }
+        } else {
+            focused_since = None;
         }
         if Instant::now() >= deadline {
             return Err("请松开修饰键并重新选择输入位置，内容已复制".into());

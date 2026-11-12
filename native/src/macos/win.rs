@@ -16,7 +16,10 @@ use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
+use objc2_app_kit::{
+    NSApplicationActivationOptions, NSRunningApplication, NSWindow, NSWindowCollectionBehavior,
+    NSWorkspace,
+};
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -201,6 +204,37 @@ pub fn force_foreground() {
         .activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
 }
 
+/// Called on the event-loop thread before showing either popup. Always-on-top alone only
+/// raises a window inside its own Space; full-screen applications live in separate Spaces.
+pub fn prepare_popup(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    let ptr = window.ns_window()?;
+    // SAFETY: Tauri owns this NSWindow, and both popup show paths run on the main thread.
+    let native = unsafe { &*ptr.cast::<NSWindow>() };
+    let mut behavior = native.collectionBehavior();
+    behavior.remove(
+        NSWindowCollectionBehavior::MoveToActiveSpace
+            | NSWindowCollectionBehavior::FullScreenPrimary
+            | NSWindowCollectionBehavior::FullScreenNone,
+    );
+    behavior.insert(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+    if objc2::available!(macos = 13.0) {
+        // Stage Manager/full-screen membership flags are mutually exclusive.
+        behavior
+            .remove(NSWindowCollectionBehavior::Primary | NSWindowCollectionBehavior::Auxiliary);
+        behavior.insert(NSWindowCollectionBehavior::CanJoinAllApplications);
+    }
+    native.setCollectionBehavior(behavior);
+    log_diagnostic(&format!(
+        "popup-spaces label={} behavior={:#x}",
+        window.label(),
+        behavior.bits()
+    ));
+    Ok(())
+}
+
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     // macOS `Boolean` is an unsigned char, not Rust's `bool`.
@@ -248,11 +282,20 @@ pub fn show_no_activate(_hwnd: ()) -> bool {
 pub fn hide_no_activate(_hwnd: ()) {}
 
 /// Synthesise Cmd+V. `focus::restore` has already put the original application back in front.
-pub fn send_paste() -> bool {
+pub fn can_send_paste() -> bool {
     if unsafe { AXIsProcessTrusted() } == 0 {
+        log_diagnostic("paste-accessibility-denied");
         request_accessibility();
         return false;
     }
+    true
+}
+
+pub fn send_paste() -> bool {
+    if !can_send_paste() {
+        return false;
+    }
+    log_diagnostic("paste-key-send");
     send_cmd_v()
 }
 

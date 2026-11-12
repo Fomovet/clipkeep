@@ -600,6 +600,12 @@ fn return_to_input(
 ) -> CmdResult<()> {
     // Ignore foreground transitions caused by restoring focus and injecting this paste.
     let _returning = focus::Returning::new();
+    #[cfg(target_os = "macos")]
+    if paste && !win::can_send_paste() {
+        return Err(
+            "请在系统设置 → 隐私与安全性 → 辅助功能中允许 clipkeep 控制电脑，内容已复制".into(),
+        );
+    }
     // A pinned panel stays visible after every paste. Explorer's rename mode is nonfocusable, so
     // preserving that editor does not require hiding the pinned panel.
     let hide_after = !keep_open;
@@ -611,6 +617,10 @@ fn return_to_input(
             return;
         }
         let restored = focus::restore(action);
+        win::log_diagnostic(&format!(
+            "restore-input result={restored:?} {}",
+            focus::diagnostic(action)
+        ));
         // A failed paste remains actionable if we still own the popup. Dismissals must
         // always close, including when the old application has already exited.
         if hide_after && (restored.is_ok() || !paste || !focus::owns_foreground()) {
@@ -1483,6 +1493,12 @@ fn reveal_tray_menu(app: &AppHandle, window: &WebviewWindow) {
     if let Err(e) = window.set_decorations(false) {
         win::log_diagnostic(&format!("style-tray-menu-failed {e}"));
     }
+    #[cfg(target_os = "macos")]
+    if let Err(e) = win::prepare_popup(window) {
+        TRAY_MENU_VISIBLE.store(false, Ordering::Relaxed);
+        win::log_diagnostic(&format!("prepare-tray-menu-failed {e}"));
+        return;
+    }
     if let Err(e) = window.show() {
         TRAY_MENU_VISIBLE.store(false, Ordering::Relaxed);
         win::log_diagnostic(&format!("show-tray-menu-failed {e}"));
@@ -1981,6 +1997,11 @@ fn show_main(app: &AppHandle) {
             return;
         }
         let _ = w.unminimize();
+        #[cfg(target_os = "macos")]
+        if let Err(e) = win::prepare_popup(&w) {
+            win::log_diagnostic(&format!("prepare-main-failed {e}"));
+            return;
+        }
         if let Err(e) = w.show() {
             win::log_diagnostic(&format!("show-main-failed {e}"));
             eprintln!("show main window failed: {e}");
