@@ -61,3 +61,10 @@ jobs:
         working-directory: native
         # The frontend was built above; skip beforeBuildCommand, which expects ui/package.json.
         run: ../ui/node_modules/.bin/tauri build --bundles app,dmg --config '{"build":{"beforeBuildCommand":null}}'
+      - name: Upload Apple Silicon installer for PR review
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipkeep-macos-apple-silicon
+          path: native/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 30

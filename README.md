@@ -57,6 +57,8 @@ cargo test --locked
 
 产物在 `native/target/release/bundle/macos/`（`.app`）和 `bundle/dmg/`（`.dmg`）。
 
+PR 验收版 `.dmg` 会作为 GitHub Actions artifact 附在对应的 macOS 构建任务中，保留 30 天。该 artifact 使用 ad-hoc 签名，适合测试 M 系列芯片兼容性；正式面向用户发布前仍需 Apple Developer ID 签名和公证。
+
 ## 功能
 
 ### 记录
