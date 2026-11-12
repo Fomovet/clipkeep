@@ -32,3 +32,32 @@ jobs:
       - name: Lint Rust
         working-directory: native
         run: cargo clippy --locked --all-targets -- -D warnings
+
+  macos:
+    runs-on: macos-15 # Apple Silicon (aarch64-apple-darwin, M1)
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: ui
+        run: npm ci
+      - name: Check and build frontend
+        working-directory: ui
+        run: npm run build
+      - name: Check Rust formatting
+        working-directory: native
+        run: cargo fmt --all -- --check
+      - name: Test Rust
+        working-directory: native
+        run: cargo test --locked
+      - name: Lint Rust
+        working-directory: native
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Bundle macOS app and dmg
+        working-directory: native
+        # The frontend was built above; skip beforeBuildCommand, which expects ui/package.json.
+        run: ../ui/node_modules/.bin/tauri build --bundles app,dmg --config '{"build":{"beforeBuildCommand":null}}'

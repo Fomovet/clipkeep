@@ -7,11 +7,18 @@
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+#[cfg(windows)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+#[cfg(windows)]
+use std::io::Read;
+use std::io::Write;
+#[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,10 +123,35 @@ fn set_state(app: &AppHandle, state: State) {
 }
 
 /// The installer leaves an uninstaller next to the exe; a single-file copy has none.
+#[cfg(windows)]
 fn is_portable() -> bool {
     std::env::current_exe()
         .map(|exe| !exe.with_file_name("uninstall.exe").exists())
         .unwrap_or(true)
+}
+
+/// The macOS build is a plain .app: there is no elevated installer to run in place, so the
+/// release page is the only update path. `download()` bails out just as it does for a portable
+/// Windows copy, and the UI keeps offering the "open download page" button.
+#[cfg(target_os = "macos")]
+fn is_portable() -> bool {
+    true
+}
+
+/// Release asset suffix for the running platform.
+#[cfg(windows)]
+const ASSET_SUFFIX: &str = "_x64-setup.exe";
+#[cfg(target_os = "macos")]
+const ASSET_SUFFIX: &str = "_aarch64.dmg";
+
+#[cfg(windows)]
+fn installer_file_name(version: &str) -> String {
+    format!("clipkeep_{version}_x64-setup.exe")
+}
+
+#[cfg(target_os = "macos")]
+fn installer_file_name(version: &str) -> String {
+    format!("clipkeep_{version}_aarch64.dmg")
 }
 
 /// Compares dotted numeric versions ("0.10.0" > "0.9.3"); non-numeric parts count as 0.
@@ -142,7 +174,8 @@ pub fn newer(remote: &str, local: &str) -> bool {
     false
 }
 
-/// Uses the Windows proxy settings (system-proxy) and the Windows certificate store (Schannel).
+/// Uses the OS proxy settings (system-proxy) and the OS certificate store (Schannel on Windows,
+/// Security.framework on macOS).
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(concat!("clipkeep/", env!("CARGO_PKG_VERSION")))
@@ -180,7 +213,7 @@ async fn github_latest() -> Result<Release, String> {
         assets.iter().find(|a| {
             a["name"]
                 .as_str()
-                .is_some_and(|n| n.ends_with("_x64-setup.exe"))
+                .is_some_and(|n| n.ends_with(ASSET_SUFFIX))
         })
     });
     Ok(Release {
@@ -355,7 +388,7 @@ async fn fetch(app: &AppHandle, release: &Release) -> Result<PathBuf, Fetch> {
     // Old installers are never needed again.
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("clipkeep_{}_x64-setup.exe", release.version));
+    let path = dir.join(installer_file_name(&release.version));
     let partial = path.with_extension("part");
 
     let mut resp = client()?.get(url).send().await?.error_for_status()?;
@@ -405,6 +438,7 @@ async fn fetch(app: &AppHandle, release: &Release) -> Result<PathBuf, Fetch> {
 
 /// Starts the verified installer in passive mode; it closes clipkeep, upgrades in place and
 /// restarts it. The caller then exits.
+#[cfg(windows)]
 pub fn install() -> Result<(), String> {
     let (version, path, expected) = match INNER.lock() {
         Ok(g) => match (
@@ -450,47 +484,106 @@ pub fn install() -> Result<(), String> {
     Ok(())
 }
 
+/// macOS has no in-place installer; `is_portable()` keeps `download()` from reaching Ready, so
+/// this is only a guard against a stale UI event.
+#[cfg(target_os = "macos")]
+pub fn install() -> Result<(), String> {
+    Err("请从发布页下载 .dmg 手动更新".into())
+}
+
+/// The app icon at the size the platform draws in the notification area (16 px at 100 %
+/// scaling on Windows). The window icon is the 32 px one, which the tray shrinks; a badge
+/// drawn on that comes out a few blurry pixels wide.
+pub fn tray_icon(app: &AppHandle) -> Option<Image<'static>> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+        let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
+        if size > 0
+            && let Ok(icon) = Image::from_app_icon_resource(size as u32)
+        {
+            return Some(icon);
+        }
+    }
+    app.default_window_icon().map(|icon| {
+        #[cfg(target_os = "macos")]
+        {
+            // Keep the logo's alpha mask (including antialiasing), with white artwork for
+            // the menu bar. Also used when refreshing the update badge, so it stays white.
+            let mut rgba = icon.rgba().to_vec();
+            for pixel in rgba.as_chunks_mut::<4>().0 {
+                pixel[..3].fill(255);
+            }
+            Image::new_owned(rgba, icon.width(), icon.height())
+        }
+        #[cfg(not(target_os = "macos"))]
+        icon.clone().to_owned()
+    })
+}
+
 /// Paints a red dot on the tray icon while a newer version is known.
 fn refresh_tray(app: &AppHandle, newer: Option<&str>) {
-    let (Some(tray), Some(base)) = (app.tray_by_id("main"), app.default_window_icon()) else {
+    let (Some(tray), Some(base)) = (app.tray_by_id("main"), tray_icon(app)) else {
         return;
     };
     let (icon, tooltip) = match newer {
         Some(version) => (
-            badged(base),
+            badged(&base),
             format!("{TRAY_TOOLTIP} · 有新版本 v{version}"),
         ),
-        None => (base.clone(), TRAY_TOOLTIP.to_owned()),
+        None => (base, TRAY_TOOLTIP.to_owned()),
     };
     let _ = tray.set_icon(Some(icon));
     let _ = tray.set_tooltip(Some(tooltip));
 }
 
+const BADGE_RED: [f32; 3] = [235.0, 59.0, 64.0];
+
+/// Share of the pixel at (x, y) inside the circle, from 4×4 samples, for smooth edges.
+fn coverage(x: u32, y: u32, cx: f32, cy: f32, r: f32) -> f32 {
+    const N: u32 = 4;
+    let mut inside = 0;
+    for sy in 0..N {
+        for sx in 0..N {
+            let px = x as f32 + (sx as f32 + 0.5) / N as f32;
+            let py = y as f32 + (sy as f32 + 0.5) / N as f32;
+            if (px - cx).powi(2) + (py - cy).powi(2) <= r * r {
+                inside += 1;
+            }
+        }
+    }
+    inside as f32 / (N * N) as f32
+}
+
+/// A notification dot in the top-right corner, where the logo is empty. A transparent gap
+/// separates it from the logo, which reads on light and dark taskbars alike.
 fn badged(base: &Image<'_>) -> Image<'static> {
     let (w, h) = (base.width(), base.height());
     let mut px = base.rgba().to_vec();
     let size = w.min(h) as f32;
-    // A notification-style dot in the top-right corner, small enough not to hide the logo.
-    let r = size * 0.12;
-    let ring = size * 0.035;
-    let (cx, cy) = (w as f32 - r - ring, r + ring);
+    let r = (size * 0.19).max(3.0);
+    let gap = (size * 0.07).max(1.0);
+    let (cx, cy) = (w as f32 - r, r);
     for y in 0..h {
         for x in 0..w {
-            let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
-            // Antialiased white ring around a red dot, so it reads on dark and light taskbars.
-            let (color, cover) = if d <= r + 0.5 {
-                ([229u8, 72, 77], (r + 0.5 - d).clamp(0.0, 1.0))
-            } else {
-                ([255u8, 255, 255], (r + ring + 0.5 - d).clamp(0.0, 1.0))
-            };
-            if cover <= 0.0 {
+            let around = coverage(x, y, cx, cy, r + gap);
+            if around == 0.0 {
                 continue;
             }
+            let dot = coverage(x, y, cx, cy, r);
             let i = ((y * w + x) * 4) as usize;
+            // The logo, cut back by the gap, with the dot composited over it.
+            let logo = px[i + 3] as f32 / 255.0 * (1.0 - around);
+            let alpha = dot + logo * (1.0 - dot);
             for c in 0..3 {
-                px[i + c] = (px[i + c] as f32 * (1.0 - cover) + color[c] as f32 * cover) as u8;
+                let value = if alpha > 0.0 {
+                    (BADGE_RED[c] * dot + px[i + c] as f32 * logo * (1.0 - dot)) / alpha
+                } else {
+                    0.0
+                };
+                px[i + c] = value.round().clamp(0.0, 255.0) as u8;
             }
-            px[i + 3] = px[i + 3].max((cover * 255.0) as u8);
+            px[i + 3] = (alpha * 255.0).round() as u8;
         }
     }
     Image::new_owned(px, w, h)
@@ -498,7 +591,25 @@ fn badged(base: &Image<'_>) -> Image<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::{State, newer};
+    use super::{Image, State, badged, newer};
+
+    #[test]
+    fn badge_sits_in_the_corner_with_a_clear_gap() {
+        // An opaque white 16 px icon, the size of the tray at 100 % scaling.
+        let base = Image::new_owned(vec![255; 16 * 16 * 4], 16, 16);
+        let out = badged(&base);
+        let px = |x: u32, y: u32| {
+            let i = ((y * 16 + x) * 4) as usize;
+            out.rgba()[i..i + 4].to_vec()
+        };
+        // The dot's centre is solid red.
+        assert_eq!(px(12, 3), vec![235, 59, 64, 255]);
+        // Just outside it, the logo is cut away so the dot stands apart.
+        assert_eq!(px(9, 3)[3], 0);
+        // The rest of the icon is untouched.
+        assert_eq!(px(2, 13), vec![255, 255, 255, 255]);
+        assert_eq!(px(8, 8), vec![255, 255, 255, 255]);
+    }
 
     #[test]
     fn compares_versions_numerically() {

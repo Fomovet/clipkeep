@@ -25,6 +25,7 @@ const groups = ref<Group[]>([]);
 const selected = ref(0);
 const pinnedWindow = ref(false);
 const searchEl = ref<HTMLInputElement | null>(null);
+const preserveExplorerRename = ref(false);
 const listEl = ref<HTMLElement | null>(null);
 const listScrolled = ref(false);
 const groupPicker = reactive({ open: false, x: 0, y: 0 });
@@ -59,6 +60,9 @@ const sendError = ref("");
 const sendLoadError = ref(false);
 const paused = ref(false);
 const notice = ref("");
+const transferBusy = ref(false);
+let transferGeneration = 0;
+let pendingFocusError = "";
 let noticeTimer: number | undefined;
 const previewClip = ref<Clip | null>(null);
 const fullText = ref("");
@@ -119,8 +123,29 @@ watch(query, () => {
   searchTimer = window.setTimeout(reload, 180);
 });
 
-const paste = (c?: Clip) => c && api.pasteClip(c.id);
-const copyOnly = (c?: Clip) => c && api.copyClip(c.id);
+function reportFocusError(error: unknown) {
+  const message = String(error);
+  if (message === "操作已取消") return;
+  if (windowShown) flash(message);
+  else pendingFocusError = message;
+}
+
+async function transfer(c: Clip | undefined, paste: boolean) {
+  if (!c || transferBusy.value) return;
+  const generation = ++transferGeneration;
+  transferBusy.value = true;
+  try {
+    if (paste) await api.pasteClip(c.id);
+    else await api.copyClip(c.id);
+  } catch (error) {
+    if (generation === transferGeneration) reportFocusError(error);
+  } finally {
+    if (generation === transferGeneration) transferBusy.value = false;
+  }
+}
+
+const paste = (c?: Clip) => transfer(c, true);
+const copyOnly = (c?: Clip) => transfer(c, false);
 const remove = (c?: Clip) => c && api.deleteClip(c.id);
 const toggleFav = (c?: Clip) => c && api.toggleFavorite(c.id);
 const togglePin = (c?: Clip) => c && api.togglePinned(c.id);
@@ -592,7 +617,7 @@ function onKey(e: KeyboardEvent) {
     if (e.key === "Escape") {
       closePreview();
       e.preventDefault();
-    } else if (editing.value && e.ctrlKey && e.key === "Enter") {
+    } else if (editing.value && (e.ctrlKey || e.metaKey) && e.key === "Enter") {
       savePreview();
       e.preventDefault();
     }
@@ -716,6 +741,7 @@ function backToTop() {
 
 function onHidden() {
   windowShown = false;
+  preserveExplorerRename.value = false;
   // Reset while hidden so the next show doesn't open on the old page or search.
   page.value = "list";
   query.value = "";
@@ -734,9 +760,12 @@ function onHidden() {
   window.clearTimeout(noticeTimer);
 }
 
-function hideWindow() {
-  onHidden();
-  void api.hideWindow();
+async function hideWindow() {
+  // The native window-hidden event is authoritative. An optimistic reset here can erase
+  // a restore error, or reset a newly opened session when an older request finishes.
+  const generation = transferGeneration;
+  try { await api.hideWindow(); }
+  catch (error) { if (generation === transferGeneration) reportFocusError(error); }
 }
 
 function timeAgo(ms: number) {
@@ -755,7 +784,7 @@ function itemHint(c: Clip, index: number) {
     `记录于 ${new Date(c.updatedAt).toLocaleString("zh-CN")}`,
     c.kind === "image" ? `${c.width}×${c.height}` : "",
     c.source ? `来自 ${c.source}` : "",
-    index < 9 ? `Ctrl+${index + 1} 快速粘贴` : "",
+    index < 9 && !preserveExplorerRename.value ? `Ctrl+${index + 1} 快速粘贴` : "",
   ].filter(Boolean).join(" · ");
 }
 
@@ -769,13 +798,21 @@ function backToList() {
   nextTick(() => searchEl.value?.focus());
 }
 
-async function onShown() {
+async function onShown(renameSafeMode?: boolean) {
+  const preserveRename = renameSafeMode ?? await api.getRenameSafeMode();
+  ++transferGeneration;
+  transferBusy.value = false;
   onHidden();
   windowShown = true;
+  preserveExplorerRename.value = preserveRename;
+  if (pendingFocusError) {
+    flash(pendingFocusError);
+    pendingFocusError = "";
+  }
   // The reload below covers a search cleared on hide whose debounced reload is still pending.
   window.clearTimeout(searchTimer);
   // Restore keyboard control before the database refresh finishes.
-  nextTick(() => searchEl.value?.focus());
+  if (!preserveRename) nextTick(() => searchEl.value?.focus());
   const ui = loadUi();
   restoreScroll = ui.scrollTop;
   selected.value = 0;
@@ -803,8 +840,12 @@ onMounted(async () => {
   unlisteners.push(
     await listen("clips-changed", () => reload(true)),
     await listen("groups-changed", reloadGroups),
-    await listen("window-shown", onShown),
+    await listen<boolean>("window-shown", (e) => onShown(e.payload)),
     await listen("window-hidden", onHidden),
+    await listen<boolean>("rename-safe-mode-changed", (e) => {
+      preserveExplorerRename.value = e.payload;
+    }),
+    await listen<string>("focus-error", (e) => reportFocusError(e.payload)),
     // Arrives after window-shown, whose reset to the list page it then overrides.
     await listen("open-about", () => openSettings(true)),
     await listen("settings-changed", syncSettings),
@@ -852,7 +893,7 @@ onUnmounted(() => {
           <button
             class="icon-btn"
             :class="{ on: pinnedWindow }"
-            :title="pinnedWindow ? '已固定（失焦不隐藏）' : '固定窗口'"
+            :title="pinnedWindow ? '已固定（粘贴后和失焦时都不隐藏）' : '固定窗口（可连续粘贴多条）'"
             @click="togglePinnedWindow"
           >
             <ClipIcon name="pin" />
@@ -867,14 +908,16 @@ onUnmounted(() => {
       <div class="search-area" :class="{ scrolled: listScrolled }">
         <div class="search">
           <ClipIcon name="search" />
-          <input ref="searchEl" v-model="query" placeholder="搜索文本…" spellcheck="false" />
+          <input ref="searchEl" v-model="query" :placeholder="preserveExplorerRename ? '重命名时请用鼠标选择记录' : '搜索文本…'" :disabled="preserveExplorerRename" spellcheck="false" />
           <button v-if="query" class="icon-btn clear" title="清除" @click="query = ''"><ClipIcon name="close" /></button>
         </div>
 
         <button v-if="paused" class="pause-banner" @click="api.toggleCapturePaused()">
           <ClipIcon name="pause" /> 记录已暂停 · 点击继续
         </button>
-        <div v-if="notice" class="notice-banner">{{ notice }}</div>
+        <div v-if="preserveExplorerRename" class="notice-banner" role="status">资源管理器正在重命名 · 用鼠标选择记录，或再次按快捷键收起</div>
+        <div v-else-if="notice" class="notice-banner" role="status">{{ notice }}</div>
+        <div v-else-if="transferBusy" class="notice-banner" role="status">正在准备内容…</div>
       </div>
 
       <ul ref="listEl" class="list" @scroll="onScroll">
@@ -883,7 +926,7 @@ onUnmounted(() => {
         <li
           v-for="(c, i) in visibleClips"
           :key="c.id"
-          v-memo="[c, i, i === selected, scope, groupName(c.groupId)]"
+          v-memo="[c, i, i === selected, scope, groupName(c.groupId), preserveExplorerRename]"
           class="item"
           :class="{ selected: i === selected, pinned: c.pinned }"
           :title="itemHint(c, i)"
@@ -898,12 +941,16 @@ onUnmounted(() => {
               <span class="image-name" :title="c.source || '剪贴板图片'">{{ c.source || '剪贴板图片' }}</span>
               <span v-if="c.width && c.height" class="image-dimensions">{{ c.width }} × {{ c.height }}</span>
             </div>
+            <div v-else-if="c.color" class="hex-preview">
+              <span class="hex-swatch" aria-hidden="true"><span :style="{ backgroundColor: c.color }"></span></span>
+              <span class="hex-value">{{ c.color }}</span>
+            </div>
             <div v-else class="text">{{ c.preview }}<span v-if="c.truncated" class="more">…</span></div>
             <div class="item-footer">
               <div class="meta">
                 <span class="meta-time">{{ timeAgo(c.updatedAt) }}</span>
                 <span class="meta-dot" aria-hidden="true">·</span>
-                <span class="meta-type"><ClipIcon :name="c.kind === 'image' ? 'image' : 'file-text'" class="tiny" />{{ c.kind === 'image' ? '图片' : '文本' }}</span>
+                <span class="meta-type"><ClipIcon :name="c.kind === 'image' ? 'image' : c.color ? 'palette' : 'file-text'" class="tiny" />{{ c.kind === 'image' ? '图片' : c.color ? 'HEX 色值' : '文本' }}</span>
                 <span v-if="c.pinned" class="meta-flag pin-flag"><ClipIcon name="pin" class="tiny" />置顶</span>
                 <span v-if="scope !== 'group' && groupName(c.groupId)" class="meta-flag group-flag" :title="groupName(c.groupId) ?? ''"><ClipIcon name="folder" class="tiny" /><span class="group-label">{{ groupName(c.groupId) }}</span></span>
               </div>
@@ -1315,6 +1362,20 @@ onUnmounted(() => {
   font-weight: 500;
 }
 .image-dimensions { color: var(--muted); font-size: var(--fs-xs); }
+.hex-preview { display: flex; align-items: center; gap: 10px; min-height: 44px; }
+/* The checkerboard shows through colours with transparency (#RGBA / #RRGGBBAA). */
+.hex-swatch {
+  display: block;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  background: repeating-conic-gradient(#ccc 0 25%, #fff 0 50%) 0 0 / 10px 10px;
+}
+.hex-swatch > span { display: block; width: 100%; height: 100%; }
+.hex-value { font-family: ui-monospace, Consolas, monospace; color: var(--text); font-size: var(--fs-lg); }
 .image-body .item-footer { grid-column: 2; margin-top: 0; }
 .item-footer {
   display: flex;

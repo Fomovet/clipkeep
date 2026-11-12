@@ -14,6 +14,8 @@ export interface Clip {
   updatedAt: number;
   source: string | null;
   groupId: number | null;
+  /** Set when the whole text is one hex colour such as `#2563eb`. */
+  color: string | null;
   thumb: string | null;
 }
 
@@ -28,6 +30,7 @@ export interface Settings {
   hotkey: string;
   captureImages: boolean;
   rememberPosition: boolean;
+  hideDockIcon: boolean;
   keepOnBlur: boolean;
   windowX: number | null;
   windowY: number | null;
@@ -41,6 +44,7 @@ export type Theme = "system" | "light" | "dark";
 
 export interface SettingsView {
   settings: Settings;
+  supportsDockVisibility: boolean;
   hotkeys: { id: string; label: string }[];
   dataDir: string;
 }
@@ -92,6 +96,7 @@ export const api = {
   pasteClip: (id: number) => invoke<void>("paste_clip", { id }),
   copyClip: (id: number) => invoke<void>("copy_clip", { id }),
   hideWindow: () => invoke<void>("hide_window"),
+  getRenameSafeMode: () => invoke<boolean>("get_rename_safe_mode"),
   startDrag: () => invoke<void>("start_drag"),
   toggleKeepOnBlur: () => invoke<boolean>("toggle_keep_on_blur"),
   getAutostart: () => invoke<boolean>("get_autostart"),

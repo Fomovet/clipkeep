@@ -3,9 +3,7 @@ use std::io::Write;
 use std::mem::size_of;
 use std::path::Path;
 use std::ptr::null_mut;
-use std::sync::atomic::{
-    AtomicBool, AtomicIsize, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
-};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,15 +11,19 @@ use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM
 use windows_sys::Win32::Globalization::{CP_OEMCP, MultiByteToWideChar};
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
     VK_CONTROL, VK_LMENU, VK_LWIN, VK_MENU, VK_OEM_3, VK_RMENU, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
-    GetWindowThreadProcessId, HC_ACTION, HHOOK, IsHungAppWindow, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-    MSG, SetForegroundWindow, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    BringWindowToTop, CallNextHookEx, DispatchMessageW, EVENT_OBJECT_FOCUS,
+    EVENT_SYSTEM_FOREGROUND, GA_ROOT, GetAncestor, GetForegroundWindow, GetMessageW,
+    GetWindowThreadProcessId, HC_ACTION, HHOOK, IsHungAppWindow, IsWindow, IsWindowVisible,
+    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, OBJID_WINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SetForegroundWindow, SetTimer, SetWindowsHookExW, ShowWindow, TranslateMessage,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
 };
 
 const VK_V: u16 = 0x56;
@@ -56,7 +58,6 @@ static HOTKEY_MODS: AtomicU8 = AtomicU8::new(MOD_WIN);
 static HOTKEY_VK: AtomicU16 = AtomicU16::new(VK_V);
 /// True from the first intercepted target-key down until its up (or a modifier release).
 static KEY_SWALLOWED: AtomicBool = AtomicBool::new(false);
-static PREV_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
 static WIN_TRACKED: AtomicU8 = AtomicU8::new(0);
 static LAST_WIN_DOWN_MS: AtomicU32 = AtomicU32::new(0);
 
@@ -442,18 +443,79 @@ pub fn disable_transitions(hwnd: HWND) {
     }
 }
 
-/// Call right before showing our window, so a paste can go back to where the user was typing.
-pub fn remember_foreground() {
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if !hwnd.is_null() && pid != std::process::id() {
-            PREV_FOREGROUND.store(hwnd as isize, Ordering::Relaxed);
+/// Keeps the active input destination current while a pinned panel stays open.
+pub fn start_foreground_tracking() {
+    thread::spawn(|| unsafe {
+        // Out-of-context events arrive through this thread's message loop.
+        let hook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            null_mut(),
+            Some(on_foreground_changed),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        if hook.is_null() {
+            log_diagnostic(&format!(
+                "foreground-tracking-failed error={}",
+                GetLastError()
+            ));
+            return;
         }
-    }
+        // A pinned panel can paste repeatedly while the user tabs between controls in the
+        // same foreground window. Foreground events alone leave the old child HWND cached.
+        let focus_hook = SetWinEventHook(
+            EVENT_OBJECT_FOCUS,
+            EVENT_OBJECT_FOCUS,
+            null_mut(),
+            Some(on_foreground_changed),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        if focus_hook.is_null() {
+            log_diagnostic(&format!(
+                "control-focus-tracking-failed error={}",
+                GetLastError()
+            ));
+        }
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if !focus_hook.is_null() {
+            UnhookWinEvent(focus_hook);
+        }
+        UnhookWinEvent(hook);
+    });
 }
 
+unsafe extern "system" fn on_foreground_changed(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if hwnd.is_null() {
+        return;
+    }
+    // Ignore queued events from a window that has already lost the foreground. In
+    // particular, a late external focus event must not erase the target after we activate.
+    let foreground = unsafe { GetForegroundWindow() };
+    let relevant = match event {
+        EVENT_SYSTEM_FOREGROUND => id_object == OBJID_WINDOW && hwnd == foreground,
+        EVENT_OBJECT_FOCUS => (unsafe { GetAncestor(hwnd, GA_ROOT) }) == foreground,
+        _ => false,
+    };
+    if relevant {
+        crate::focus::foreground_changed();
+    }
+}
 /// Windows only lets the process that owns the foreground window hand focus away, so borrow its
 /// input queue for the switch. Skipped for a hung app, whose queue could stall ours. UI thread only.
 pub fn force_foreground(hwnd: HWND) {
@@ -474,18 +536,30 @@ pub fn force_foreground(hwnd: HWND) {
     }
 }
 
-pub fn paste_to_previous_window() {
-    let prev = PREV_FOREGROUND.load(Ordering::Relaxed) as HWND;
-    if !prev.is_null() {
-        unsafe { SetForegroundWindow(prev) };
+/// Show the clipboard window above Explorer without activating it. This keeps an inline rename
+/// edit alive; Tauri's visibility state remains hidden so the normal activating path can be used
+/// on the next session after set_focusable(true).
+pub fn show_no_activate(hwnd: HWND) -> bool {
+    if unsafe { IsWindow(hwnd) } == 0 {
+        return false;
     }
-    thread::sleep(Duration::from_millis(80));
+    unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+    unsafe { IsWindowVisible(hwnd) != 0 }
+}
+
+pub fn hide_no_activate(hwnd: HWND) {
+    if unsafe { IsWindow(hwnd) } != 0 {
+        unsafe { ShowWindow(hwnd, SW_HIDE) };
+    }
+}
+
+pub fn send_paste() -> bool {
     send_keys(&[
         (VK_CONTROL, false),
         (VK_V, false),
         (VK_V, true),
         (VK_CONTROL, true),
-    ]);
+    ])
 }
 
 fn send_keys<const N: usize>(keys: &[(u16, bool); N]) -> bool {

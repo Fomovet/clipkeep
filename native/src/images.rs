@@ -6,6 +6,7 @@ use image::{
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::io::{Error as IoError, ErrorKind};
+#[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,7 @@ const MAX_SIDE: u32 = 30_000;
 /// Hard ceiling on decoder allocations, so a malformed or hostile PNG fails instead of aborting
 /// the process on an out-of-memory allocation.
 const MAX_DECODE_ALLOC: u64 = 400 * 1024 * 1024;
+#[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 pub struct Rgba {
@@ -74,9 +76,20 @@ fn temp_image_file(name: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+#[cfg(windows)]
 fn is_reparse_point(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        Err(error) => error.kind() != ErrorKind::NotFound,
+    }
+}
+
+/// A symlink is the Unix equivalent of a reparse point for this guard: never follow one into
+/// the image store.
+#[cfg(target_os = "macos")]
+fn is_reparse_point(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.file_type().is_symlink(),
         Err(error) => error.kind() != ErrorKind::NotFound,
     }
 }
