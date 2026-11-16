@@ -9,7 +9,6 @@ mod focus;
 mod focus;
 mod images;
 mod lan;
-mod recover;
 mod settings;
 mod update;
 
@@ -22,6 +21,8 @@ mod dib;
 #[cfg(windows)]
 mod instances;
 #[cfg(windows)]
+mod recover;
+#[cfg(windows)]
 mod win;
 
 #[cfg(target_os = "macos")]
@@ -30,6 +31,9 @@ mod clipboard;
 #[cfg(target_os = "macos")]
 #[path = "macos/instances.rs"]
 mod instances;
+#[cfg(target_os = "macos")]
+#[path = "macos/recover.rs"]
+mod recover;
 #[cfg(target_os = "macos")]
 #[path = "macos/win.rs"]
 mod win;
@@ -2435,11 +2439,8 @@ pub fn run() {
             if let Some(w) = main_window(&handle) {
                 recover::watch(&handle, &w);
             }
-            let to_tray = match recover::resuming(&handle.state::<Core>().data_dir) {
-                Some(recover::Resume::Tray) => true,
-                Some(recover::Resume::Panel) => false,
-                None => std::env::args().any(|a| a == AUTOSTART_ARG),
-            };
+            let to_tray = recover::resume_in_tray(&handle.state::<Core>().data_dir)
+                .unwrap_or_else(|| std::env::args().any(|a| a == AUTOSTART_ARG));
             if !to_tray {
                 show_main(&handle);
             } else if let Some(w) = main_window(&handle) {

@@ -46,7 +46,7 @@ pub fn quitting() {
 
 /// What the process started by a recovery restart does with the panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Resume {
+enum Resume {
     /// WebView2 went away by itself: come back quietly.
     Tray,
     /// The user asked for the panel and got a restart instead: show it.
@@ -96,10 +96,16 @@ fn read_marker(path: &Path) -> Option<Marker> {
 }
 
 /// `Some` when this start is the restart after a lost WebView2.
-pub fn resuming(data_dir: &Path) -> Option<Resume> {
+fn resuming(data_dir: &Path) -> Option<Resume> {
     read_marker(&data_dir.join(MARKER))
         .filter(|marker| marker.age < RESUME_WINDOW)
         .map(|marker| marker.resume)
+}
+
+/// For the restart after a lost WebView2: whether to come back in the tray (`true`) or with the
+/// panel shown. `None` for any other start, which follows the command line as usual.
+pub fn resume_in_tray(data_dir: &Path) -> Option<bool> {
+    resuming(data_dir).map(|resume| resume == Resume::Tray)
 }
 
 /// Whether the panel may not be shown because WebView2 is gone. Each attempt to show it retries
