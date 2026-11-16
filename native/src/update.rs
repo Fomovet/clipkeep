@@ -1,7 +1,8 @@
 //! Update check, download and install.
 //!
-//! The check asks GitHub and jsDelivr at the same time (GitHub is often slow or unreachable from
-//! mainland China) and takes the higher version. Downloads come from GitHub Releases and are
+//! The check asks GitHub and jsDelivr at the same time. GitHub's answer is the one that counts;
+//! jsDelivr only stands in when GitHub can't be reached (it is often slow or blocked from
+//! mainland China). Downloads come from GitHub Releases and are
 //! verified against the SHA-256 digest GitHub publishes for the asset; nothing is installed
 //! without that match, and nothing is downloaded or installed without the user asking.
 
@@ -208,6 +209,13 @@ async fn jsdelivr_latest() -> Result<String, String> {
         .ok_or_else(|| "no version".into())
 }
 
+/// The latest version on offer. GitHub lists published releases and is authoritative. jsDelivr
+/// lists git tags behind a cache: it can still name a tag that was withdrawn, or one whose
+/// release isn't published yet, so it is only believed when GitHub didn't answer.
+fn remote_version(github: Option<&str>, jsdelivr: Option<String>) -> Option<String> {
+    github.map(str::to_owned).or(jsdelivr)
+}
+
 /// `quiet` is the start-up check: it only ever announces a new version, never "up to date" or
 /// a network error, and it doesn't interrupt a check or download already under way.
 pub async fn check(app: &AppHandle, quiet: bool) {
@@ -225,12 +233,14 @@ pub async fn check(app: &AppHandle, quiet: bool) {
     let github = tauri::async_runtime::spawn(github_latest());
     let jsdelivr = tauri::async_runtime::spawn(jsdelivr_latest());
     let github = github.await.ok().and_then(Result::ok);
-    let jsdelivr = jsdelivr.await.ok().and_then(Result::ok);
-
-    let remote = match (github.as_ref().map(|r| r.version.clone()), jsdelivr) {
-        (Some(a), Some(b)) => Some(if newer(&b, &a) { b } else { a }),
-        (a, b) => a.or(b),
+    // Only wait for jsDelivr when it is needed; both were started together, so falling back
+    // costs no extra time.
+    let jsdelivr = match github {
+        Some(_) => None,
+        None => jsdelivr.await.ok().and_then(Result::ok),
     };
+
+    let remote = remote_version(github.as_ref().map(|r| r.version.as_str()), jsdelivr);
     let next = match remote {
         Some(version) if newer(&version, &local) => {
             let release = github.filter(|r| r.version == version);
@@ -535,7 +545,26 @@ fn badged(base: &Image<'_>) -> Image<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Image, State, badged, newer};
+    use super::{Image, State, badged, newer, remote_version};
+
+    #[test]
+    fn github_decides_and_jsdelivr_only_fills_in() {
+        // A withdrawn tag still cached by jsDelivr must not be announced.
+        assert_eq!(
+            remote_version(Some("0.2.2"), Some("0.2.3".into())).as_deref(),
+            Some("0.2.2")
+        );
+        // GitHub unreachable: jsDelivr is better than nothing.
+        assert_eq!(
+            remote_version(None, Some("0.2.3".into())).as_deref(),
+            Some("0.2.3")
+        );
+        assert_eq!(
+            remote_version(Some("0.2.2"), None).as_deref(),
+            Some("0.2.2")
+        );
+        assert_eq!(remote_version(None, None), None);
+    }
 
     #[test]
     fn badge_sits_in_the_corner_with_a_clear_gap() {
