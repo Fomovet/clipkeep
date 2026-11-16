@@ -6,6 +6,7 @@ mod focus;
 mod images;
 mod instances;
 mod lan;
+mod recover;
 mod settings;
 mod update;
 mod win;
@@ -652,6 +653,7 @@ fn install_update(app: AppHandle) -> CmdResult<()> {
     if let Some(core) = app.try_state::<Core>() {
         core.persist_position();
     }
+    recover::quitting();
     app.exit(0);
     Ok(())
 }
@@ -1592,6 +1594,7 @@ fn tray_menu_action(app: AppHandle, action: String) -> CmdResult<()> {
             if let Some(core) = app.try_state::<Core>() {
                 core.persist_position();
             }
+            recover::quitting();
             app.exit(0);
         }
         // A newer version is known: downloading and installing are confirmed in Settings.
@@ -1681,6 +1684,10 @@ fn hide_main_window(app: &AppHandle) {
 }
 
 fn show_main(app: &AppHandle) {
+    // With WebView2 gone the window would be an invisible sheet that swallows clicks.
+    if recover::blocks_show(app) {
+        return;
+    }
     win::log_diagnostic("show-main-begin");
     let preserve_editor = focus::begin_session();
     hide_tray_menu_window(app);
@@ -2098,10 +2105,19 @@ pub fn run() {
                 }
             });
 
-            if !std::env::args().any(|a| a == AUTOSTART_ARG) {
+            if let Some(w) = main_window(&handle) {
+                recover::watch(&handle, &w);
+            }
+            let to_tray = match recover::resuming(&handle.state::<Core>().data_dir) {
+                Some(recover::Resume::Tray) => true,
+                Some(recover::Resume::Panel) => false,
+                None => std::env::args().any(|a| a == AUTOSTART_ARG),
+            };
+            if !to_tray {
                 show_main(&handle);
             } else if let Some(w) = main_window(&handle) {
-                // Started at logon into the tray: hidden until the first hotkey.
+                // Started at logon, or restarted after losing WebView2: hidden until the
+                // first hotkey.
                 set_low_memory(&w, true);
             }
             Ok(())
