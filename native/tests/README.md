@@ -13,7 +13,7 @@ npm --prefix ui run dev
 另开终端编译原生测试窗口并运行：
 
 ```powershell
-cargo build --manifest-path native/Cargo.toml --example focus_probe --locked
+cargo build --manifest-path native/Cargo.toml --example focus_probe --features focus-probe --locked
 python native/tests/focus_regression.py --probe native/target/debug/examples/focus_probe.exe
 python ui/tests/focus_ipc_smoke.py
 ```

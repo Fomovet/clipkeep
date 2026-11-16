@@ -617,7 +617,7 @@ function onKey(e: KeyboardEvent) {
     if (e.key === "Escape") {
       closePreview();
       e.preventDefault();
-    } else if (editing.value && e.ctrlKey && e.key === "Enter") {
+    } else if (editing.value && (e.ctrlKey || e.metaKey) && e.key === "Enter") {
       savePreview();
       e.preventDefault();
     }

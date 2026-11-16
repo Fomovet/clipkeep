@@ -19,6 +19,8 @@ pub struct Settings {
     pub hotkey: String,
     pub capture_images: bool,
     pub remember_position: bool,
+    /// macOS: run as an accessory app, keeping the menu bar icon but hiding the Dock icon.
+    pub hide_dock_icon: bool,
     /// Keep the window open when it loses focus (the pin button).
     pub keep_on_blur: bool,
     pub window_x: Option<i32>,
@@ -39,6 +41,7 @@ impl Default for Settings {
             hotkey: "win+v".into(),
             capture_images: true,
             remember_position: false,
+            hide_dock_icon: false,
             keep_on_blur: false,
             window_x: None,
             window_y: None,

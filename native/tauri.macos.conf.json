@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "security": {
+      "csp": {
+        "default-src": "'self' tauri:",
+        "script-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost tauri: tauri://localhost",
+        "img-src": "'self' asset: http://asset.localhost tauri: tauri://localhost data: blob:",
+        "style-src": "'self' 'unsafe-inline'",
+        "object-src": "'none'",
+        "base-uri": "'none'"
+      }
+    }
+  },
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "hardenedRuntime": true,
+      "signingIdentity": "-"
+    }
+  }
+}
