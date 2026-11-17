@@ -2330,7 +2330,7 @@ pub fn run() {
         // Before the single-instance check, which would otherwise hand over to that copy.
         instances::retire_older_instance();
     }
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // With WebView2 focused, Tauri's default device filter can starve the host process's
         // WH_KEYBOARD_LL hook. Always keeps Win+V observable inside our own window too.
         .device_event_filter(tauri::DeviceEventFilter::Always)
@@ -2341,7 +2341,12 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_ARG]),
         ))
-        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_dialog::init());
+    // Official WKWebView hook (macOS/iOS only). Replaces Tauri's default in-place reload, so
+    // the handler hides the always-on-top panel first and then reloads itself.
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(recover::on_content_process_terminated);
+    builder
         .setup(|app| {
             let handle = app.handle().clone();
 
