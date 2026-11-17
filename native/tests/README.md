@@ -44,3 +44,9 @@ python native/tests/focus_app_regression.py --probe native/target/debug/examples
 交付 EXE 启动后，还可运行 `focus_release_smoke.py --exe <交付EXE> --pid <已核实的修复版进程ID> --probe <focus_probe.exe>`。该检查通过真实单实例唤起和原生按键验证 Enter、Ctrl+1、Shift+Enter、Esc，断言窗口确实属于给定进程，且返回两个原生控件各自的光标位置。
 
 默认报告和截图写到 `docs/focus-qa/`（本地忽略目录）。可用 `--output` 指定报告目录；两个浏览器测试均可用 `CLIPKEEP_QA_BROWSER_EXE` 指定独立 Chromium。Tauri 测试使用应用自身的 WebView2。测试结束后退出 QA 实例并停止 Vite，交付构建使用默认标识、不启用调试端口。
+
+## macOS
+
+GitHub Actions 的 `macos-15` 作业会运行 `cargo test`（包括焦点会话与 WKWebView 重载限流的单元测试）和 `clippy`，并打出 DMG。该环境不能交互式授予「辅助功能」权限，因此没有与上面 Windows 脚本对等的桌面回归。
+
+macOS 在已经获得辅助功能权限时，会尽力把焦点恢复到呼出面板前的窗口和输入控件。部分应用（尤其是网页内容）不会暴露稳定的控件，这时仍只恢复到前台应用；自动粘贴不会因为这次尽力恢复失败而被取消。

@@ -6,6 +6,7 @@ import { api, applyTheme, loadUi, saveUi, type Clip, type Group, type LanPeer, t
 import SettingsView from "./components/SettingsView.vue";
 import ClipIcon from "./components/ClipIcon.vue";
 import { useUpdate } from "./update";
+import { modShortcut } from "./platform";
 
 const page = ref<"list" | "settings">("list");
 const { newer: newerVersion } = useUpdate();
@@ -784,7 +785,7 @@ function itemHint(c: Clip, index: number) {
     `记录于 ${new Date(c.updatedAt).toLocaleString("zh-CN")}`,
     c.kind === "image" ? `${c.width}×${c.height}` : "",
     c.source ? `来自 ${c.source}` : "",
-    index < 9 && !preserveExplorerRename.value ? `Ctrl+${index + 1} 快速粘贴` : "",
+    index < 9 && !preserveExplorerRename.value ? `${modShortcut(String(index + 1))} 快速粘贴` : "",
   ].filter(Boolean).join(" · ");
 }
 
@@ -959,7 +960,7 @@ onUnmounted(() => {
                 <button
                   class="icon-btn sm star-op"
                   :class="{ active: c.favorite }"
-                  :title="c.favorite ? '取消收藏 (Ctrl+S)' : '收藏 (Ctrl+S)'"
+                  :title="c.favorite ? `取消收藏 (${modShortcut('S')})` : `收藏 (${modShortcut('S')})`"
                   :aria-label="c.favorite ? '取消收藏' : '收藏'"
                   :aria-pressed="c.favorite"
                   @click.stop="toggleFav(c)"
@@ -1088,7 +1089,7 @@ onUnmounted(() => {
       <textarea v-else-if="editing" ref="editorEl" v-model="draftText" class="preview-editor" spellcheck="false"></textarea>
       <pre v-else class="preview-content">{{ fullText }}</pre>
       <footer class="preview-foot">
-        <span>{{ editing ? 'Ctrl+Enter 保存 · Esc 取消' : '可选择并复制任意段落' }}</span>
+        <span>{{ editing ? `${modShortcut('Enter')} 保存 · Esc 取消` : '可选择并复制任意段落' }}</span>
         <button v-if="editing" class="preview-action" :disabled="previewBusy" @click="savePreview">保存</button>
         <button v-else class="preview-action" :disabled="previewBusy || !!previewError" @click="startEditing">编辑</button>
       </footer>

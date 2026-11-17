@@ -281,9 +281,14 @@ pub fn show_no_activate(_hwnd: ()) -> bool {
 #[allow(dead_code)]
 pub fn hide_no_activate(_hwnd: ()) {}
 
+/// Whether the process already has Accessibility permission. Does not prompt.
+pub fn accessibility_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
 /// Synthesise Cmd+V. `focus::restore` has already put the original application back in front.
 pub fn can_send_paste() -> bool {
-    if unsafe { AXIsProcessTrusted() } == 0 {
+    if !accessibility_trusted() {
         log_diagnostic("paste-accessibility-denied");
         request_accessibility();
         return false;
