@@ -93,14 +93,16 @@ mod tests {
                 "attempt {i} should be allowed"
             );
         }
+        let last = start + Duration::from_millis((RELOAD_LIMIT as u64 - 1) * 10);
         assert!(
-            !allow_reload(&mut attempts, start + Duration::from_millis(20)),
+            !allow_reload(&mut attempts, last),
             "a fourth reload inside the window must be refused"
         );
+        // The window is measured from each attempt, so wait until the newest one expires.
         assert!(
             allow_reload(
                 &mut attempts,
-                start + RELOAD_WINDOW + Duration::from_millis(1)
+                last + RELOAD_WINDOW + Duration::from_millis(1)
             ),
             "after the window expires a reload is allowed again"
         );
