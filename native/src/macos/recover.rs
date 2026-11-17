@@ -14,7 +14,7 @@ use crate::{hide_main, hide_tray_menu_window, win};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Webview, WebviewWindow};
+use tauri::{AppHandle, Manager, Webview, WebviewWindow};
 
 const RELOAD_WINDOW: Duration = Duration::from_secs(10);
 const RELOAD_LIMIT: usize = 3;
