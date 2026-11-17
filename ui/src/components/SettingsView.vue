@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type LanState, type Settings, type SettingsView, type StorageUsage, type Theme } from "../api";
 import { formatSize, useUpdate } from "../update";
+import { isMac, modShortcut } from "../platform";
 import ClipIcon from "./ClipIcon.vue";
 
 defineEmits<{ back: [] }>();
@@ -41,6 +42,9 @@ const updateDesc = computed(() => {
     case "checking": return "正在检查最新版本…";
     case "upToDate": return "已是最新版";
     case "available":
+      if (isMac) {
+        return `发现新版本 v${s.version}${s.size ? `（${formatSize(s.size)}）` : ""}。请下载 Apple Silicon 的 DMG，打开后将 clipkeep 拖到「应用程序」文件夹（可覆盖已有应用）`;
+      }
       return s.portable
         ? `发现新版本 v${s.version}。单文件版请下载后替换当前的 exe`
         : `发现新版本 v${s.version}${s.size ? `（${formatSize(s.size)}）` : ""}，下载完成后由你确认安装`;
@@ -334,7 +338,7 @@ onUnmounted(() => {
         <label class="row">
           <div class="label">
             <div class="name">开机自启</div>
-            <div class="desc">创建当前用户登录时以管理员权限运行的计划任务，启动后静默到托盘；关闭时删除任务。</div>
+            <div class="desc">{{ isMac ? "登录当前用户时自动启动，启动后静默到菜单栏；关闭后不再随登录启动，无需管理员权限。" : "创建当前用户登录时以管理员权限运行的计划任务，启动后静默到托盘；关闭时删除任务。" }}</div>
           </div>
           <input v-if="autostart !== null" type="checkbox" class="switch" :checked="autostart" @change="toggleAutostart" />
           <span v-else class="switch-placeholder" aria-hidden="true"></span>
@@ -471,8 +475,8 @@ onUnmounted(() => {
           </select>
         </div>
         <p class="hint">
-          <kbd>↑</kbd><kbd>↓</kbd> 选择 · <kbd>Enter</kbd> 粘贴 · <kbd>Shift+Enter</kbd> 仅复制 · <kbd>Ctrl+1–9</kbd> 快速粘贴 ·
-          <kbd>Ctrl+P</kbd> 置顶 · <kbd>Ctrl+S</kbd> 收藏 · <kbd>Ctrl+D</kbd> 删除 · <kbd>Tab</kbd> 切分组 · <kbd>Esc</kbd> 关闭
+          <kbd>↑</kbd><kbd>↓</kbd> 选择 · <kbd>Enter</kbd> 粘贴 · <kbd>Shift+Enter</kbd> 仅复制 · <kbd>{{ modShortcut("1–9") }}</kbd> 快速粘贴 ·
+          <kbd>{{ modShortcut("P") }}</kbd> 置顶 · <kbd>{{ modShortcut("S") }}</kbd> 收藏 · <kbd>{{ modShortcut("D") }}</kbd> 删除 · <kbd>Tab</kbd> 切分组 · <kbd>Esc</kbd> 关闭
         </p>
       </div>
 
