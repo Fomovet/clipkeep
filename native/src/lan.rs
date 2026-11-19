@@ -1,5 +1,10 @@
-//! Small, opt-in, one-way text transfer over the local network.
+//! Opt-in, one-way transfer of recorded text and images over the local network.
 //! The receive code contains a random key; possession of that code authorizes sending.
+//!
+//! Text stays on the original `CKL1` frame (`clipkeep-lan-text-v1`), so a peer from before
+//! image support still accepts it. Images use `CKL2` (`clipkeep-lan-image-v1`). A text-only
+//! peer rejects that magic before reading the body, so an image is not saved as text and
+//! cannot make it allocate the payload. Windows and macOS share this module.
 
 use crate::{Core, changed, clipboard};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -19,9 +24,20 @@ use tauri::{AppHandle, Emitter, Manager};
 
 const PORT: u16 = 45788;
 const MAGIC: &[u8; 4] = b"CKL1";
+const IMAGE_MAGIC: &[u8; 4] = b"CKL2";
 const AAD: &[u8] = b"clipkeep-lan-text-v1";
+const IMAGE_AAD: &[u8] = b"clipkeep-lan-image-v1";
 const ACK_AAD: &[u8] = b"clipkeep-lan-ack-v1";
 const MAX_CIPHER_BYTES: usize = clipboard::MAX_TEXT_BYTES + 16;
+/// Largest PNG payload. The ciphertext cap is this plus the 16-byte Poly1305 tag.
+/// A screenshot PNG fits well under it; anything larger is refused before it is sent.
+pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_IMAGE_CIPHER_BYTES: usize = MAX_IMAGE_BYTES + 16;
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+const TEXT_IO_TIMEOUT: Duration = Duration::from_secs(4);
+const IMAGE_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Image bodies are read in short slices so turning reception off does not wait out the full transfer budget.
+const IMAGE_READ_SLICE: Duration = Duration::from_millis(200);
 const CODE_PREFIX: &str = "cklan1://";
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -72,6 +88,8 @@ pub struct LanState {
     pub receive_enabled: bool,
     pub local_codes: Vec<LocalCode>,
     pub peers: Vec<PeerView>,
+    /// PNG payload cap advertised to the UI, matching [`MAX_IMAGE_BYTES`].
+    pub max_image_bytes: usize,
 }
 
 struct Worker {
@@ -171,6 +189,7 @@ impl LanService {
                     address: p.address.clone(),
                 })
                 .collect(),
+            max_image_bytes: MAX_IMAGE_BYTES,
         })
     }
 
@@ -298,6 +317,19 @@ impl LanService {
         if text.trim().is_empty() || text.len() > clipboard::MAX_TEXT_BYTES {
             return Err("只能传送不超过 2 MB 的非空文本".into());
         }
+        let (target, key) = self.paired_target(address)?;
+        let mut stream = connect(&target)?;
+        send_stream(&mut stream, &key, text)
+    }
+
+    pub fn send_image(&self, address: &str, png: &[u8]) -> Result<(), String> {
+        validate_png_for_send(png)?;
+        let (target, key) = self.paired_target(address)?;
+        let mut stream = connect(&target)?;
+        send_image_stream(&mut stream, &key, png)
+    }
+
+    fn paired_target(&self, address: &str) -> Result<(SocketAddr, [u8; 32]), String> {
         let peer = self
             .config
             .lock()
@@ -312,19 +344,26 @@ impl LanService {
         if !matches!(target, SocketAddr::V4(a) if allowed_ip(*a.ip()) && a.port() == PORT) {
             return Err("仅支持本地网络 IPv4 地址和默认端口".into());
         }
-        let mut stream = TcpStream::connect_timeout(&target, Duration::from_secs(3))
-            .map_err(|e| format!("连接设备失败：{e}"))?;
-        send_stream(&mut stream, &key, text)
+        Ok((target, key))
     }
 }
 
+fn connect(target: &SocketAddr) -> Result<TcpStream, String> {
+    TcpStream::connect_timeout(target, Duration::from_secs(3))
+        .map_err(|e| format!("连接设备失败：{e}"))
+}
+
+fn set_io_timeout(stream: &mut TcpStream, timeout: Duration) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| e.to_string())
+}
+
 fn send_stream(stream: &mut TcpStream, key: &[u8; 32], text: &str) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(4)))
-        .map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(4)))
-        .map_err(|e| e.to_string())?;
+    set_io_timeout(stream, TEXT_IO_TIMEOUT)?;
     let frame = encrypt_frame(key, text)?;
     stream
         .write_all(&frame)
@@ -336,25 +375,67 @@ fn send_stream(stream: &mut TcpStream, key: &[u8; 32], text: &str) -> Result<(),
     verify_ack(key, &ack)
 }
 
-fn encrypt_frame(key: &[u8; 32], text: &str) -> Result<Vec<u8>, String> {
+fn send_image_stream(stream: &mut TcpStream, key: &[u8; 32], png: &[u8]) -> Result<(), String> {
+    validate_png_for_send(png)?;
+    set_io_timeout(stream, IMAGE_IO_TIMEOUT)?;
+    let frame = encrypt_image_frame(key, png)?;
+    stream
+        .write_all(&frame)
+        .map_err(|e| format!("发送图片失败：{e}。若对方是只支持文本的旧版本，它会直接拒绝图片"))?;
+    let mut ack = [0u8; 30];
+    stream.read_exact(&mut ack).map_err(|_| {
+        "对方未确认接收图片。请确认对方已开启接收；只支持文本的旧版本会拒绝图片".to_string()
+    })?;
+    verify_ack(key, &ack)
+}
+
+fn image_limit_error() -> String {
+    format!(
+        "只能传送不超过 {} MB 的图片",
+        MAX_IMAGE_BYTES / (1024 * 1024)
+    )
+}
+
+fn reject_image_size(len: usize) -> Result<(), String> {
+    if len == 0 {
+        Err("图片是空的".into())
+    } else if len > MAX_IMAGE_BYTES {
+        Err(image_limit_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_png_for_send(png: &[u8]) -> Result<(), String> {
+    reject_image_size(png.len())?;
+    if !png.starts_with(PNG_MAGIC) {
+        return Err("图片格式无效".into());
+    }
+    Ok(())
+}
+
+fn seal(magic: &[u8; 4], aad: &[u8], key: &[u8; 32], plain: &[u8]) -> Result<Vec<u8>, String> {
     let mut nonce = [0u8; 12];
     getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
     let cipher = ChaCha20Poly1305::new(&Key::from(*key));
     let ciphertext = cipher
-        .encrypt(
-            &Nonce::from(nonce),
-            Payload {
-                msg: text.as_bytes(),
-                aad: AAD,
-            },
-        )
+        .encrypt(&Nonce::from(nonce), Payload { msg: plain, aad })
         .map_err(|_| "加密失败")?;
     let mut frame = Vec::with_capacity(20 + ciphertext.len());
-    frame.extend_from_slice(MAGIC);
+    frame.extend_from_slice(magic);
     frame.extend_from_slice(&nonce);
     frame.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
     frame.extend_from_slice(&ciphertext);
     Ok(frame)
+}
+
+fn encrypt_frame(key: &[u8; 32], text: &str) -> Result<Vec<u8>, String> {
+    seal(MAGIC, AAD, key, text.as_bytes())
+}
+
+fn encrypt_image_frame(key: &[u8; 32], png: &[u8]) -> Result<Vec<u8>, String> {
+    validate_png_for_send(png)?;
+    seal(IMAGE_MAGIC, IMAGE_AAD, key, png)
 }
 
 fn make_ack(key: &[u8; 32]) -> Result<[u8; 30], String> {
@@ -389,7 +470,7 @@ fn verify_ack(key: &[u8; 32], ack: &[u8; 30]) -> Result<(), String> {
         )
         .map_err(|_| "设备确认无效")?;
     if receipt != b"OK" {
-        return Err("设备拒绝了文本".into());
+        return Err("设备拒绝了内容".into());
     }
     Ok(())
 }
@@ -404,7 +485,9 @@ fn receive_loop(listener: TcpListener, key: [u8; 32], app: AppHandle, stop: Arc<
                 }
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                if let Err(e) = receive_one(&mut stream, &key, &app) {
+                if let Err(e) = receive_one(&mut stream, &key, &app, &stop)
+                    && !stop.load(Ordering::SeqCst)
+                {
                     eprintln!("LAN receive rejected: {e}");
                 }
             }
@@ -419,58 +502,201 @@ fn receive_loop(listener: TcpListener, key: [u8; 32], app: AppHandle, stop: Arc<
     }
 }
 
-fn read_text_frame(reader: &mut impl Read, key: &[u8; 32]) -> Result<String, String> {
+#[derive(Debug)]
+enum Incoming {
+    Text(String),
+    Image(Vec<u8>),
+}
+
+struct FrameHeader {
+    magic: [u8; 4],
+    nonce: [u8; 12],
+    len: usize,
+}
+
+fn read_frame_header(reader: &mut impl Read) -> Result<FrameHeader, String> {
     let mut header = [0u8; 20];
     reader.read_exact(&mut header).map_err(|e| e.to_string())?;
-    if &header[..4] != MAGIC {
-        return Err("协议版本不匹配".into());
-    }
-    let len = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
-    if !(16..=MAX_CIPHER_BYTES).contains(&len) {
-        return Err("文本长度超限".into());
-    }
-    let mut ciphertext = vec![0u8; len];
-    reader
-        .read_exact(&mut ciphertext)
-        .map_err(|e| e.to_string())?;
-    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
+    let magic: [u8; 4] = header[..4].try_into().unwrap();
     let nonce: [u8; 12] = header[4..16].try_into().unwrap();
-    let plain = cipher
+    let len = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
+    let max = if &magic == IMAGE_MAGIC {
+        MAX_IMAGE_CIPHER_BYTES
+    } else if &magic == MAGIC {
+        MAX_CIPHER_BYTES
+    } else {
+        return Err("协议版本不匹配".into());
+    };
+    if !(16..=max).contains(&len) {
+        return Err(if &magic == IMAGE_MAGIC {
+            "图片大小超限".into()
+        } else {
+            "文本长度超限".into()
+        });
+    }
+    Ok(FrameHeader { magic, nonce, len })
+}
+
+fn open_frame(header: &FrameHeader, ciphertext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
+    let aad: &[u8] = if &header.magic == IMAGE_MAGIC {
+        IMAGE_AAD
+    } else {
+        AAD
+    };
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
+    cipher
         .decrypt(
-            &Nonce::from(nonce),
+            &Nonce::from(header.nonce),
             Payload {
-                msg: &ciphertext,
-                aad: AAD,
+                msg: ciphertext,
+                aad,
             },
         )
-        .map_err(|_| "配对码不匹配或数据损坏")?;
+        .map_err(|_| "配对码不匹配或数据损坏".into())
+}
+
+fn decode_plain(header: &FrameHeader, plain: Vec<u8>) -> Result<Incoming, String> {
+    if &header.magic == IMAGE_MAGIC {
+        if plain.len() > MAX_IMAGE_BYTES {
+            return Err("图片大小超限".into());
+        }
+        if !plain.starts_with(PNG_MAGIC) {
+            return Err("图片格式无效".into());
+        }
+        return Ok(Incoming::Image(plain));
+    }
     let text = String::from_utf8(plain).map_err(|_| "文本编码无效")?;
     if text.trim().is_empty() {
         return Err("空文本".into());
     }
-    Ok(text)
+    Ok(Incoming::Text(text))
 }
 
-fn receive_one(stream: &mut TcpStream, key: &[u8; 32], app: &AppHandle) -> Result<(), String> {
-    receive_stream(stream, key, |text| {
+fn finish_frame(
+    header: FrameHeader,
+    reader: &mut impl Read,
+    key: &[u8; 32],
+) -> Result<Incoming, String> {
+    let mut ciphertext = vec![0u8; header.len];
+    reader
+        .read_exact(&mut ciphertext)
+        .map_err(|e| e.to_string())?;
+    let plain = open_frame(&header, &ciphertext, key)?;
+    decode_plain(&header, plain)
+}
+
+#[cfg(test)]
+fn read_incoming(reader: &mut impl Read, key: &[u8; 32]) -> Result<Incoming, String> {
+    let header = read_frame_header(reader)?;
+    finish_frame(header, reader, key)
+}
+
+fn store_png(
+    images: &crate::images::ImageStore,
+    png: &[u8],
+) -> Result<crate::images::Saved, String> {
+    let rgba = crate::images::decode_png(png)?;
+    let hash = crate::images::hash(&rgba);
+    images.write(&rgba, &hash)
+}
+
+#[cfg(test)]
+fn read_text_frame(reader: &mut impl Read, key: &[u8; 32]) -> Result<String, String> {
+    match read_incoming(reader, key)? {
+        Incoming::Text(text) => Ok(text),
+        Incoming::Image(_) => Err("协议版本不匹配".into()),
+    }
+}
+
+fn receive_one(
+    stream: &mut TcpStream,
+    key: &[u8; 32],
+    app: &AppHandle,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    receive_incoming(stream, key, Some(stop), |incoming| {
         let core = app.state::<Core>();
-        core.save_text(text, Some("局域网"))?;
+        match incoming {
+            Incoming::Text(text) => core.save_text(&text, Some("局域网"))?,
+            Incoming::Image(png) => {
+                let saved = store_png(&core.images, &png)?;
+                core.save_image(&saved, Some("局域网"))?;
+            }
+        }
+        // History only. Nothing here writes the receiver's clipboard.
         changed(app);
         Ok(())
     })
 }
 
+/// Reads an image body without sitting in one 30s `read`. `stop` is checked between slices, so
+/// `LanService::stop` — used when reception is turned off or the pairing code rotates — can join
+/// the worker instead of waiting out the whole transfer budget.
+fn read_image_body(
+    stream: &mut TcpStream,
+    len: usize,
+    stop: Option<&AtomicBool>,
+) -> Result<Vec<u8>, String> {
+    stream
+        .set_read_timeout(Some(IMAGE_READ_SLICE))
+        .map_err(|e| e.to_string())?;
+    let mut body = vec![0u8; len];
+    let mut filled = 0;
+    let deadline = std::time::Instant::now() + IMAGE_IO_TIMEOUT;
+    while filled < len {
+        if stop.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return Err("接收已关闭".into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("读取图片超时".into());
+        }
+        match stream.read(&mut body[filled..]) {
+            Ok(0) => return Err("连接已关闭".into()),
+            Ok(n) => filled += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(body)
+}
+
+fn receive_incoming(
+    stream: &mut TcpStream,
+    key: &[u8; 32],
+    stop: Option<&AtomicBool>,
+    save: impl FnOnce(Incoming) -> Result<(), String>,
+) -> Result<(), String> {
+    let header = read_frame_header(stream)?;
+    let incoming = if &header.magic == IMAGE_MAGIC {
+        let ciphertext = read_image_body(stream, header.len, stop)?;
+        let plain = open_frame(&header, &ciphertext, key)?;
+        decode_plain(&header, plain)?
+    } else {
+        finish_frame(header, stream, key)?
+    };
+    save(incoming)?;
+    stream
+        .write_all(&make_ack(key)?)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn receive_stream(
     stream: &mut TcpStream,
     key: &[u8; 32],
     save_text: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<(), String> {
-    let text = read_text_frame(stream, key)?;
-    save_text(&text)?;
-    stream
-        .write_all(&make_ack(key)?)
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    receive_incoming(stream, key, None, |incoming| match incoming {
+        Incoming::Text(text) => save_text(&text),
+        Incoming::Image(_) => Err("收到了图片帧".into()),
+    })
 }
 
 #[cfg(test)]
@@ -602,5 +828,276 @@ mod tests {
         let mut sender = TcpStream::connect(address).unwrap();
         assert!(send_stream(&mut sender, &key, "不能误报成功").is_err());
         assert_eq!(receiver.join().unwrap(), "存储失败");
+    }
+
+    fn sample_png() -> Vec<u8> {
+        use image::ImageEncoder as _;
+        let pixels = [9u8, 17, 25, 255];
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&pixels, 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        png
+    }
+
+    /// The text-only reader this crate shipped before image frames. Kept here, not called from
+    /// the new parser, so a `CKL2` image is proven to fail closed on an old peer.
+    fn text_only_client_read(reader: &mut impl Read, key: &[u8; 32]) -> Result<String, String> {
+        use chacha20poly1305::{
+            ChaCha20Poly1305, Key, KeyInit, Nonce,
+            aead::{Aead, Payload},
+        };
+        let mut header = [0u8; 20];
+        reader.read_exact(&mut header).map_err(|e| e.to_string())?;
+        if &header[..4] != MAGIC {
+            return Err("协议版本不匹配".into());
+        }
+        let len = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
+        if !(16..=MAX_CIPHER_BYTES).contains(&len) {
+            return Err("文本长度超限".into());
+        }
+        let mut ciphertext = vec![0u8; len];
+        reader
+            .read_exact(&mut ciphertext)
+            .map_err(|e| e.to_string())?;
+        let cipher = ChaCha20Poly1305::new(&Key::from(*key));
+        let nonce: [u8; 12] = header[4..16].try_into().unwrap();
+        let plain = cipher
+            .decrypt(
+                &Nonce::from(nonce),
+                Payload {
+                    msg: &ciphertext,
+                    aad: AAD,
+                },
+            )
+            .map_err(|_| "配对码不匹配或数据损坏")?;
+        let text = String::from_utf8(plain).map_err(|_| "文本编码无效")?;
+        if text.trim().is_empty() {
+            return Err("空文本".into());
+        }
+        Ok(text)
+    }
+
+    fn header_only(magic: &[u8; 4], len: u32) -> [u8; 20] {
+        let mut header = [0u8; 20];
+        header[..4].copy_from_slice(magic);
+        header[16..20].copy_from_slice(&len.to_be_bytes());
+        header
+    }
+
+    #[test]
+    fn image_frames_roundtrip_and_keep_text_frames() {
+        let key = decode_key(&Config::fresh().receive_key).unwrap();
+        let png = sample_png();
+        let frame = encrypt_image_frame(&key, &png).unwrap();
+        match read_incoming(&mut frame.as_slice(), &key).unwrap() {
+            Incoming::Image(bytes) => assert_eq!(bytes, png),
+            Incoming::Text(_) => panic!("image frame decoded as text"),
+        }
+        let mut tampered = frame.clone();
+        tampered[20] ^= 1;
+        assert!(read_incoming(&mut tampered.as_slice(), &key).is_err());
+        let mut wrong_key = key;
+        wrong_key[0] ^= 1;
+        assert!(read_incoming(&mut frame.as_slice(), &wrong_key).is_err());
+        let mut as_text = frame.clone();
+        as_text[..4].copy_from_slice(MAGIC);
+        assert!(read_incoming(&mut as_text.as_slice(), &key).is_err());
+
+        let text = encrypt_frame(&key, "仍是文本").unwrap();
+        match read_incoming(&mut text.as_slice(), &key).unwrap() {
+            Incoming::Text(value) => assert_eq!(value, "仍是文本"),
+            Incoming::Image(_) => panic!("text frame decoded as image"),
+        }
+
+        let garbage = seal(IMAGE_MAGIC, IMAGE_AAD, &key, b"not-a-png-payload").unwrap();
+        assert!(
+            read_incoming(&mut garbage.as_slice(), &key)
+                .unwrap_err()
+                .contains("图片格式无效")
+        );
+        let huge = header_only(IMAGE_MAGIC, u32::MAX);
+        assert!(
+            read_incoming(&mut &huge[..], &key)
+                .unwrap_err()
+                .contains("图片大小超限"),
+            "an oversized image length must be refused before the body is read"
+        );
+        assert_eq!(validate_png_for_send(&[]).unwrap_err(), "图片是空的");
+        assert!(validate_png_for_send(b"nope").unwrap_err().contains("格式"));
+        assert!(reject_image_size(MAX_IMAGE_BYTES).is_ok());
+        assert_eq!(
+            reject_image_size(MAX_IMAGE_BYTES + 1).unwrap_err(),
+            image_limit_error()
+        );
+    }
+
+    #[test]
+    fn text_only_client_rejects_image_frames_without_saving_them() {
+        let key = decode_key(&Config::fresh().receive_key).unwrap();
+        let png = sample_png();
+        assert!(png.len() + 16 <= MAX_CIPHER_BYTES);
+        let image = encrypt_image_frame(&key, &png).unwrap();
+        let err = text_only_client_read(&mut image.as_slice(), &key).unwrap_err();
+        assert!(
+            err.contains("协议版本不匹配"),
+            "old peers must reject the image magic, got {err}"
+        );
+        let text = encrypt_frame(&key, "旧端仍能收文本").unwrap();
+        assert_eq!(
+            text_only_client_read(&mut text.as_slice(), &key).unwrap(),
+            "旧端仍能收文本"
+        );
+        let huge = header_only(IMAGE_MAGIC, u32::MAX);
+        assert!(
+            text_only_client_read(&mut &huge[..], &key)
+                .unwrap_err()
+                .contains("协议版本不匹配")
+        );
+    }
+
+    #[test]
+    fn send_image_checks_the_payload_before_connecting() {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "clipkeep-lan-image-guard-{}",
+            u64::from_ne_bytes(random)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let service = LanService::new(&dir);
+        let address = format!("127.0.0.1:{PORT}");
+        let err = service.send_image(&address, b"nope").unwrap_err();
+        assert!(err.contains("图片格式无效"), "{err}");
+        assert!(!err.contains("连接"), "{err}");
+        drop(service);
+        std::fs::remove_file(dir.join("lan.json")).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn socket_image_is_stored_as_history() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let key = decode_key(&Config::fresh().receive_key).unwrap();
+        let png = sample_png();
+        let payload = png.clone();
+        let receiver = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).unwrap();
+            let dir = std::env::temp_dir().join(format!(
+                "clipkeep-lan-image-recv-{}",
+                u64::from_ne_bytes(random)
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let store = crate::images::ImageStore::new(&dir).unwrap();
+            let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+            receive_incoming(&mut stream, &key, None, |incoming| {
+                let Incoming::Image(bytes) = incoming else {
+                    return Err("图片被当成了文本".into());
+                };
+                let saved = store_png(&store, &bytes)?;
+                let clip = crate::db::NewClip {
+                    kind: crate::db::KIND_IMAGE,
+                    content: &saved.file,
+                    hash: &saved.hash,
+                    width: Some(saved.width),
+                    height: Some(saved.height),
+                    size: saved.bytes as i64,
+                    source: Some("局域网"),
+                };
+                crate::db::upsert(&conn, &clip, 0).map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+            let clips = crate::db::list(&conn, crate::db::Scope::All, "").unwrap();
+            assert_eq!(clips.len(), 1);
+            let clip = &clips[0];
+            assert_eq!(clip.kind, crate::db::KIND_IMAGE);
+            assert_eq!(clip.width, Some(1));
+            assert_eq!(clip.height, Some(1));
+            assert_eq!(clip.source.as_deref(), Some("局域网"));
+            assert!(clip.preview.is_empty());
+            let file = clip.file.clone().unwrap();
+            let loaded = store.load(&file).unwrap();
+            let expected = crate::images::decode_png(&png).unwrap();
+            assert_eq!(loaded.pixels, expected.pixels);
+            let thumb = store.thumb_path(&file).unwrap();
+            assert!(thumb.is_file());
+            assert_eq!(
+                crate::images::decode_png(&std::fs::read(&thumb).unwrap())
+                    .unwrap()
+                    .pixels,
+                expected.pixels
+            );
+            drop(store);
+            drop(conn);
+            std::fs::remove_dir_all(&dir).unwrap();
+        });
+        let mut sender = TcpStream::connect(address).unwrap();
+        send_image_stream(&mut sender, &key, &payload).unwrap();
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn socket_image_is_rejected_by_text_only_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let key = decode_key(&Config::fresh().receive_key).unwrap();
+        let receiver = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let err = text_only_client_read(&mut stream, &key).unwrap_err();
+            assert!(
+                err.contains("协议版本不匹配"),
+                "old peer should reject the frame, got {err}"
+            );
+        });
+        let mut sender = TcpStream::connect(address).unwrap();
+        let err = send_image_stream(&mut sender, &key, &sample_png()).unwrap_err();
+        assert!(
+            err.contains("旧版本") || err.contains("未确认") || err.contains("发送图片失败"),
+            "{err}"
+        );
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn stopping_reception_interrupts_a_stalled_image_read() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let key = decode_key(&Config::fresh().receive_key).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let receiver = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let started = std::time::Instant::now();
+            let err = receive_incoming(&mut stream, &key, Some(&thread_stop), |_| {
+                Err("停掉的传输不应写入历史".into())
+            })
+            .unwrap_err();
+            (err, started.elapsed())
+        });
+        let mut sender = TcpStream::connect(address).unwrap();
+        sender
+            .write_all(&header_only(IMAGE_MAGIC, 64 * 1024))
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::SeqCst);
+        let (err, elapsed) = receiver.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stop waited {elapsed:?}: {err}"
+        );
+        assert!(err.contains("接收已关闭"), "{err}");
     }
 }

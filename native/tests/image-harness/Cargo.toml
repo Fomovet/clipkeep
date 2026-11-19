@@ -1,0 +1,11 @@
+# Compile the production image module without the Windows/macOS desktop shell.
+[package]
+name = "clipkeep-image-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+blake3 = "1.5"
+getrandom = "0.4.3"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }

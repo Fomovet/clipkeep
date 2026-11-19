@@ -2,10 +2,13 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { api, applyTheme, loadUi, saveUi, type Clip, type Group, type LanPeer, type Scope } from "./api";
+import { api, applyTheme, loadUi, saveUi, type Clip, type Group, type KindFilter, type LanPeer, type MacosSetupState, type Scope } from "./api";
 import SettingsView from "./components/SettingsView.vue";
+import AccessibilityGuide from "./components/AccessibilityGuide.vue";
 import ClipIcon from "./components/ClipIcon.vue";
-import { useUpdate } from "./update";
+import { formatSize, useUpdate } from "./update";
+import { hasModKey, modShortcut, shiftShortcut } from "./platform";
+import { clearSelection, reconcileSelection, keyboardSelectionFocus, hoverSelectionFocus, toggleSelection, rangeSelection } from "./selection";
 
 const page = ref<"list" | "settings">("list");
 const { newer: newerVersion } = useUpdate();
@@ -14,6 +17,13 @@ const focusAbout = ref(false);
 const scope = ref<Scope>("all");
 const activeGroup = ref<number | null>(null);
 const query = ref("");
+const kindFilter = ref<KindFilter>("all");
+const kindOptions: { id: KindFilter; label: string }[] = [
+  { id: "all", label: "全部" },
+  { id: "text", label: "文本" },
+  { id: "image", label: "图片" },
+  { id: "color", label: "色值" },
+];
 const clips = ref<Clip[]>([]);
 // Rows are rendered in steps: all 1000 cost the renderer ~40MB while a screenful is visible.
 const RENDER_STEP = 100;
@@ -37,7 +47,7 @@ const groupInput = ref<HTMLInputElement | null>(null);
 const groupEditor = reactive({ open: false, mode: "create" as "create" | "rename", groupId: 0, name: "", error: "", busy: false, x: 0, y: 0 });
 const groupMenu = reactive({ open: false, groupId: 0, confirming: false, x: 0, y: 0 });
 const moveMenu = reactive({ open: false, clipId: 0, x: 0, y: 0 });
-const sendMenu = reactive({ open: false, clipId: 0, x: 0, y: 0 });
+const sendMenu = reactive({ open: false, clipId: 0, kind: "text" as Clip["kind"], x: 0, y: 0 });
 const clipMenu = reactive({ open: false, clipId: 0, x: 0, y: 0 });
 let menuGeneration = 0;
 let windowShown = false;
@@ -60,6 +70,15 @@ const sendError = ref("");
 const sendLoadError = ref(false);
 const paused = ref(false);
 const notice = ref("");
+const accessibilityGuide = ref(false);
+const accessibilityMode = ref<"first-run" | "recovery">("first-run");
+const accessibilityTrusted = ref(false);
+const accessibilityHint = ref("");
+const accessibilityBusy = ref(false);
+let accessibilityTimer: number | undefined;
+let accessibilitySync = 0;
+let accessibilityHold = 0;
+let accessibilityHoldOpen = false;
 const transferBusy = ref(false);
 let transferGeneration = 0;
 let pendingFocusError = "";
@@ -70,8 +89,21 @@ const draftText = ref("");
 const editing = ref(false);
 const previewBusy = ref(false);
 const previewError = ref("");
+const imageSaveError = ref("");
 const editorEl = ref<HTMLTextAreaElement | null>(null);
 let previewGeneration = 0;
+// Multi-select is an interaction State (which rows are checked). It is distinct from
+// `selected` (the focused/current row) and from any Status. It is a prerequisite for a
+// later merge-paste feature; this change only implements the selection itself.
+const multiSelect = reactive({
+  ids: [] as number[],
+  anchor: null as number | null,
+});
+const inMultiSelect = computed(() => multiSelect.ids.length > 0);
+const previewImageSrc = computed(() => {
+  const clip = previewClip.value;
+  return clip?.kind === "image" && clip.image ? convertFileSrc(clip.image) : "";
+});
 let dragIndex = -1;
 let searchTimer: number | undefined;
 let scrollTimer: number | undefined;
@@ -84,7 +116,7 @@ let loadSeq = 0;
 async function reload(keepScroll = false) {
   const seq = ++loadSeq;
   const prev = keepScroll ? (listEl.value?.scrollTop ?? 0) : 0;
-  const rows = await api.listClips(scope.value, activeGroup.value, query.value);
+  const rows = await api.listClips(scope.value, activeGroup.value, query.value, kindFilter.value);
   if (seq !== loadSeq) return;
   // A refresh keeps the rows already rendered; a fresh load renders enough to reach the
   // remembered scroll position.
@@ -94,6 +126,7 @@ async function reload(keepScroll = false) {
   }
   clips.value = rows;
   if (selected.value >= rows.length) selected.value = Math.max(0, rows.length - 1);
+  reconcileSelection(multiSelect, rows, rows[selected.value]);
   nextTick(() => {
     if (listEl.value) listEl.value.scrollTop = keepScroll ? prev : restoreScroll;
     listScrolled.value = (listEl.value?.scrollTop ?? 0) > 0;
@@ -112,12 +145,14 @@ function selectScope(s: Scope, groupId: number | null = null) {
   saveUi({ scope: s, groupId });
 }
 
-watch([scope, activeGroup], () => {
+watch([scope, activeGroup, kindFilter], () => {
+  clearSelection(multiSelect);
   selected.value = 0;
   reload();
 });
 // Debounced so a full-text LIKE scan doesn't run on every keystroke.
 watch(query, () => {
+  clearSelection(multiSelect);
   selected.value = 0;
   window.clearTimeout(searchTimer);
   searchTimer = window.setTimeout(reload, 180);
@@ -138,7 +173,8 @@ async function transfer(c: Clip | undefined, paste: boolean) {
     if (paste) await api.pasteClip(c.id);
     else await api.copyClip(c.id);
   } catch (error) {
-    if (generation === transferGeneration) reportFocusError(error);
+    const explained = paste && (await explainAccessibilityIfNeeded());
+    if (!explained && generation === transferGeneration) reportFocusError(error);
   } finally {
     if (generation === transferGeneration) transferBusy.value = false;
   }
@@ -156,13 +192,48 @@ function flash(message: string) {
   noticeTimer = window.setTimeout(() => (notice.value = ""), 4500);
 }
 
+function clearMultiSelect() {
+  clearSelection(multiSelect, clips.value[selected.value]);
+}
+
+function toggleMulti(index: number) {
+  const row = clips.value[index];
+  if (row) toggleSelection(multiSelect, row);
+}
+
+function rangeMultiSelect(index: number) {
+  rangeSelection(multiSelect, clips.value, index);
+}
+
+// A plain click still pastes immediately. Only modifier+click changes multi-select State.
+function onItemClick(c: Clip, index: number, e: MouseEvent) {
+  if (e.shiftKey) {
+    rangeMultiSelect(index);
+    selected.value = index;
+    return;
+  }
+  if (hasModKey(e)) {
+    toggleMulti(index);
+    selected.value = index;
+    return;
+  }
+  clearMultiSelect();
+  paste(c);
+}
+
 async function openPreview(c: Clip) {
-  if (c.kind !== "text") return;
   const generation = ++previewGeneration;
   previewClip.value = c;
+  imageSaveError.value = "";
   fullText.value = "";
+  draftText.value = "";
   previewError.value = "";
   editing.value = false;
+  if (c.kind === "image") {
+    previewBusy.value = false;
+    if (!c.image) previewError.value = "找不到原图文件";
+    return;
+  }
   previewBusy.value = true;
   try {
     const text = await api.getClipText(c.id);
@@ -174,6 +245,47 @@ async function openPreview(c: Clip) {
   } finally {
     if (generation === previewGeneration) previewBusy.value = false;
   }
+}
+
+function togglePreview() {
+  if (previewClip.value) {
+    if (!editing.value) closePreview();
+    return;
+  }
+  const current = clips.value[selected.value];
+  if (current) openPreview(current);
+}
+
+async function saveClipAsFile(c?: Clip) {
+  if (!c || c.kind !== "image" || previewBusy.value) return;
+  const generation = previewGeneration;
+  previewBusy.value = true;
+  imageSaveError.value = "";
+  try {
+    const path = await api.saveClipImage(c.id);
+    if (generation !== previewGeneration && previewClip.value) return;
+    if (path) flash(`已保存到 ${path}`);
+  } catch (e) {
+    if (previewClip.value && generation === previewGeneration) imageSaveError.value = String(e);
+    else flash(`保存失败：${e}`);
+  } finally {
+    if (generation === previewGeneration) previewBusy.value = false;
+  }
+}
+
+function previewSizeLabel(c: Clip) {
+  if (c.kind === "image") {
+    const dims = c.width && c.height ? `${c.width}×${c.height}` : "";
+    const size = c.size ? formatSize(c.size) : "";
+    return [dims, size].filter(Boolean).join(" · ");
+  }
+  return `${(editing.value ? draftText.value.length : fullText.value.length).toLocaleString()} 字符`;
+}
+
+function previewFootHint(c: Clip) {
+  if (c.kind === "image") return "空格关闭预览";
+  if (editing.value) return `${modShortcut("Enter")} 保存 · Esc 取消`;
+  return "可选择并复制任意段落 · 空格关闭";
 }
 
 function closePreview() {
@@ -242,6 +354,7 @@ function openSendMenu(c: Clip, row: HTMLElement, focus: boolean) {
   closeSubmenus();
   const generation = menuGeneration;
   sendMenu.clipId = c.id;
+  sendMenu.kind = c.kind;
   lanPeers.value = [];
   sendLoading.value = true;
   sendError.value = "";
@@ -577,12 +690,13 @@ function openClipMenu(c: Clip, e: MouseEvent) {
   nextTick(() => (document.querySelector(".clip-menu .menu-row") as HTMLButtonElement | null)?.focus());
 }
 
-function menuAction(action: "copy" | "preview" | "favorite" | "pin" | "delete") {
+function menuAction(action: "copy" | "preview" | "save" | "favorite" | "pin" | "delete") {
   const c = menuClip.value;
   closeMenus();
   if (!c) return;
   if (action === "copy") copyOnly(c);
   else if (action === "preview") openPreview(c);
+  else if (action === "save") saveClipAsFile(c);
   else if (action === "favorite") toggleFav(c);
   else if (action === "pin") togglePin(c);
   else remove(c);
@@ -600,8 +714,45 @@ async function moveTo(groupId: number | null) {
 function move(delta: number) {
   if (!clips.value.length) return;
   selected.value = Math.min(clips.value.length - 1, Math.max(0, selected.value + delta));
-  nextTick(() => listEl.value?.children[selected.value]?.scrollIntoView({ block: "nearest" }));
+  keyboardSelectionFocus(multiSelect, clips.value[selected.value]);
+  nextTick(() => (listEl.value?.querySelector(`[data-clip-index="${selected.value}"]`) as HTMLElement | null)?.scrollIntoView({ block: "nearest" }));
 }
+
+type DateBucket = "pinned" | "today" | "yesterday" | "earlier";
+const BUCKET_LABEL: Record<DateBucket, string> = {
+  pinned: "置顶",
+  today: "今天",
+  yesterday: "昨天",
+  earlier: "更早",
+};
+
+function dateBucket(ms: number): "today" | "yesterday" | "earlier" {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const today = start.getTime();
+  if (ms >= today) return "today";
+  if (ms >= today - 86_400_000) return "yesterday";
+  return "earlier";
+}
+
+type ListRow =
+  | { key: string; kind: "heading"; label: string }
+  | { key: string; kind: "clip"; clip: Clip; index: number };
+
+// Date segmentation only (plus an existing-order 置顶 heading). Not auto-grouping of related clips.
+const listRows = computed<ListRow[]>(() => {
+  const rows: ListRow[] = [];
+  let last: DateBucket | null = null;
+  visibleClips.value.forEach((clip, index) => {
+    const bucket: DateBucket = clip.pinned ? "pinned" : dateBucket(clip.updatedAt);
+    if (bucket !== last) {
+      rows.push({ key: `h-${bucket}-${index}`, kind: "heading", label: BUCKET_LABEL[bucket] });
+      last = bucket;
+    }
+    rows.push({ key: `c-${clip.id}`, kind: "clip", clip, index });
+  });
+  return rows;
+});
 
 const tabKeys = computed<Array<Scope | number>>(() => ["all", "fav", ...groups.value.map((g) => g.id)]);
 function cycleTab(dir: number) {
@@ -613,8 +764,16 @@ function cycleTab(dir: number) {
 }
 
 function onKey(e: KeyboardEvent) {
+  if (accessibilityGuide.value) {
+    // Esc hides the panel. Leaving it open keeps the steps on screen until an explicit choice.
+    if (e.key === "Escape") e.preventDefault();
+    return;
+  }
   if (previewClip.value) {
     if (e.key === "Escape") {
+      closePreview();
+      e.preventDefault();
+    } else if (e.key === " " && !editing.value) {
       closePreview();
       e.preventDefault();
     } else if (editing.value && (e.ctrlKey || e.metaKey) && e.key === "Enter") {
@@ -685,12 +844,23 @@ function onKey(e: KeyboardEvent) {
   const ctrl = e.ctrlKey || e.metaKey;
   const key = e.key.toLowerCase();
   let handled = true;
-  if (e.key === "Escape") query.value ? (query.value = "") : hideWindow();
+  if (e.key === "Escape") {
+    if (inMultiSelect.value) clearMultiSelect();
+    else if (query.value) query.value = "";
+    else hideWindow();
+  }
   else if (e.key === "ArrowDown") move(1);
   else if (e.key === "ArrowUp") move(-1);
   else if (e.key === "PageDown") move(8);
   else if (e.key === "PageUp") move(-8);
   else if (e.key === "Enter") e.shiftKey ? copyOnly(current) : paste(current);
+  else if (e.key === " ") {
+    const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
+    const inSearch = e.target === searchEl.value;
+    // Keep Space typable in search once a query has been started; an empty search still previews.
+    if (typing && !(inSearch && !query.value)) handled = false;
+    else togglePreview();
+  }
   else if (e.key === "Tab") {
     e.preventDefault();
     cycleTab(e.shiftKey ? -1 : 1);
@@ -709,6 +879,7 @@ let lastPointer = { x: -1, y: -1 };
 function onItemHover(i: number, e: MouseEvent) {
   if (e.screenX === lastPointer.x && e.screenY === lastPointer.y) return;
   lastPointer = { x: e.screenX, y: e.screenY };
+  hoverSelectionFocus(multiSelect, clips.value[selected.value]);
   selected.value = i;
 }
 
@@ -733,6 +904,7 @@ function backToTop() {
   if (!listEl.value) return;
   listEl.value.scrollTop = 0;
   selected.value = 0;
+  keyboardSelectionFocus(multiSelect, clips.value[0]);
   listScrolled.value = false;
   window.clearTimeout(scrollTimer);
   saveUi({ scrollTop: 0 });
@@ -745,6 +917,7 @@ function onHidden() {
   // Reset while hidden so the next show doesn't open on the old page or search.
   page.value = "list";
   query.value = "";
+  kindFilter.value = "all";
   listScrolled.value = false;
   closeMenus();
   previewGeneration++;
@@ -758,6 +931,7 @@ function onHidden() {
   moveFilter.value = "";
   notice.value = "";
   window.clearTimeout(noticeTimer);
+  clearSelection(multiSelect);
 }
 
 async function hideWindow() {
@@ -784,7 +958,7 @@ function itemHint(c: Clip, index: number) {
     `记录于 ${new Date(c.updatedAt).toLocaleString("zh-CN")}`,
     c.kind === "image" ? `${c.width}×${c.height}` : "",
     c.source ? `来自 ${c.source}` : "",
-    index < 9 && !preserveExplorerRename.value ? `Ctrl+${index + 1} 快速粘贴` : "",
+    index < 9 && !preserveExplorerRename.value ? `${modShortcut(String(index + 1))} 快速粘贴` : "",
   ].filter(Boolean).join(" · ");
 }
 
@@ -812,7 +986,12 @@ async function onShown(renameSafeMode?: boolean) {
   // The reload below covers a search cleared on hide whose debounced reload is still pending.
   window.clearTimeout(searchTimer);
   // Restore keyboard control before the database refresh finishes.
-  if (!preserveRename) nextTick(() => searchEl.value?.focus());
+  // The accessibility guide has its own focus; typing must not land in the search box under it.
+  if (!preserveRename && !accessibilityGuide.value) {
+    nextTick(() => {
+      if (!accessibilityGuide.value) searchEl.value?.focus();
+    });
+  }
   const ui = loadUi();
   restoreScroll = ui.scrollTop;
   selected.value = 0;
@@ -827,7 +1006,143 @@ async function onShown(renameSafeMode?: boolean) {
   }
   const [, , isPaused] = await Promise.all([reloadGroups(), reload(), api.getCapturePaused()]);
   paused.value = isPaused;
+  void syncAccessibility();
 }
+
+function applyAccessibilityState(state: MacosSetupState) {
+  if (!state.applies) {
+    accessibilityGuide.value = false;
+    return;
+  }
+  if (state.trusted) {
+    if (accessibilityGuide.value) {
+      accessibilityTrusted.value = true;
+      accessibilityHint.value = "";
+    }
+    return;
+  }
+  accessibilityTrusted.value = false;
+  if (state.showGuide) openAccessibilityGuide("first-run");
+}
+
+async function syncAccessibility(attempt = 0) {
+  const generation = attempt === 0 ? ++accessibilitySync : accessibilitySync;
+  try {
+    const state = await api.macosSetupState();
+    if (generation !== accessibilitySync) return;
+    applyAccessibilityState(state);
+  } catch {
+    // The window can load before the backend finishes starting.
+    if (generation !== accessibilitySync || attempt >= 8) return;
+    window.setTimeout(() => { void syncAccessibility(attempt + 1); }, 300);
+  }
+}
+
+function pushAccessibilityHold(hold: boolean) {
+  accessibilityHoldOpen = hold;
+  const generation = ++accessibilityHold;
+  // An earlier request can land after a newer one. Re-apply the latest choice when that happens.
+  void api.setAccessibilityGuideHold(hold).finally(() => {
+    if (generation !== accessibilityHold) void api.setAccessibilityGuideHold(accessibilityHoldOpen);
+  });
+}
+
+function openAccessibilityGuide(mode: "first-run" | "recovery") {
+  accessibilityMode.value = mode;
+  if (!accessibilityGuide.value) {
+    accessibilityTrusted.value = false;
+    accessibilityHint.value = "";
+  }
+  accessibilityGuide.value = true;
+  searchEl.value?.blur();
+  pushAccessibilityHold(true);
+}
+
+async function explainAccessibilityIfNeeded() {
+  try {
+    const state = await api.macosSetupState();
+    if (!state.applies || state.trusted) return false;
+    openAccessibilityGuide("recovery");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function recheckAccessibility() {
+  if (!accessibilityGuide.value || accessibilityTrusted.value) return;
+  try {
+    const state = await api.macosSetupState();
+    if (state.applies && state.trusted && accessibilityGuide.value) {
+      accessibilityTrusted.value = true;
+      accessibilityHint.value = "";
+    }
+  } catch {
+    // The next poll, or 「我已授权」, retries the check.
+  }
+}
+
+async function confirmAccessibility() {
+  accessibilityBusy.value = true;
+  try {
+    const state = await api.macosSetupState();
+    if (state.trusted) {
+      accessibilityTrusted.value = true;
+      accessibilityHint.value = "";
+      return;
+    }
+    accessibilityHint.value = "还没有检测到授权。请确认「系统设置 → 隐私与安全性 → 辅助功能」里的 clipkeep 开关已经打开，然后回到这里再点一次。";
+  } catch (error) {
+    accessibilityHint.value = `暂时无法检查授权：${error}`;
+  } finally {
+    accessibilityBusy.value = false;
+  }
+}
+
+async function openAccessibilitySettings() {
+  try {
+    await api.openAccessibilitySettings();
+  } catch (error) {
+    accessibilityHint.value = `无法打开系统设置：${error}`;
+  }
+}
+
+async function dismissAccessibility() {
+  accessibilityBusy.value = true;
+  accessibilityHoldOpen = false;
+  accessibilityHold++;
+  try {
+    await api.dismissAccessibilityGuide();
+    accessibilityGuide.value = false;
+    accessibilityTrusted.value = false;
+    accessibilityHint.value = "";
+  } catch (error) {
+    accessibilityHoldOpen = true;
+    pushAccessibilityHold(true);
+    accessibilityHint.value = `没能记住这个选择：${error}`;
+  } finally {
+    accessibilityBusy.value = false;
+  }
+}
+
+async function finishAccessibility() {
+  accessibilityGuide.value = false;
+  accessibilityTrusted.value = false;
+  accessibilityHint.value = "";
+  accessibilityHoldOpen = false;
+  accessibilityHold++;
+  try {
+    await api.setAccessibilityGuideHold(false);
+  } catch {
+    // Blur can hide the panel again once the guide is gone.
+  }
+}
+
+watch(accessibilityGuide, (open) => {
+  window.clearInterval(accessibilityTimer);
+  if (!open) return;
+  accessibilityTimer = window.setInterval(() => { void recheckAccessibility(); }, 1000);
+});
 
 function preventNativeContextMenu(event: MouseEvent) {
   event.preventDefault();
@@ -870,13 +1185,14 @@ onUnmounted(() => {
   window.clearTimeout(noticeTimer);
   window.clearTimeout(searchTimer);
   window.clearTimeout(scrollTimer);
+  window.clearInterval(accessibilityTimer);
   unlisteners.forEach((u) => u());
 });
 </script>
 
 <template>
   <div class="shell">
-    <SettingsView v-if="page === 'settings'" :focus-about="focusAbout" @back="backToList" />
+    <SettingsView v-if="page === 'settings'" :focus-about="focusAbout" @back="backToList" @show-accessibility-guide="openAccessibilityGuide('first-run')" />
 
     <template v-else>
       <header class="topbar" @mousedown.self.left="startWindowDrag">
@@ -908,8 +1224,19 @@ onUnmounted(() => {
       <div class="search-area" :class="{ scrolled: listScrolled }">
         <div class="search">
           <ClipIcon name="search" />
-          <input ref="searchEl" v-model="query" :placeholder="preserveExplorerRename ? '重命名时请用鼠标选择记录' : '搜索文本…'" :disabled="preserveExplorerRename" spellcheck="false" />
+          <input ref="searchEl" v-model="query" :placeholder="preserveExplorerRename ? '重命名时请用鼠标选择记录' : '搜索文本或图片文件名…'" :disabled="preserveExplorerRename" spellcheck="false" />
           <button v-if="query" class="icon-btn clear" title="清除" @click="query = ''"><ClipIcon name="close" /></button>
+        </div>
+        <div class="kind-filters" role="toolbar" aria-label="类型筛选">
+          <button
+            v-for="opt in kindOptions"
+            :key="opt.id"
+            type="button"
+            class="kind-chip"
+            :class="{ active: kindFilter === opt.id }"
+            :aria-pressed="kindFilter === opt.id"
+            @click="kindFilter = opt.id"
+          >{{ opt.label }}</button>
         </div>
 
         <button v-if="paused" class="pause-banner" @click="api.toggleCapturePaused()">
@@ -918,64 +1245,71 @@ onUnmounted(() => {
         <div v-if="preserveExplorerRename" class="notice-banner" role="status">资源管理器正在重命名 · 用鼠标选择记录，或再次按快捷键收起</div>
         <div v-else-if="notice" class="notice-banner" role="status">{{ notice }}</div>
         <div v-else-if="transferBusy" class="notice-banner" role="status">正在准备内容…</div>
+        <div v-if="inMultiSelect" class="multi-bar" role="status">
+          <span>已选择 {{ multiSelect.ids.length }} 项</span>
+          <button type="button" class="multi-bar-clear" @click="clearMultiSelect">取消选择</button>
+        </div>
       </div>
 
       <ul ref="listEl" class="list" @scroll="onScroll">
         <!-- Clips are replaced, never mutated, so a row only re-renders when its inputs change
-             instead of all of them on every selection move. -->
-        <li
-          v-for="(c, i) in visibleClips"
-          :key="c.id"
-          v-memo="[c, i, i === selected, scope, groupName(c.groupId), preserveExplorerRename]"
-          class="item"
-          :class="{ selected: i === selected, pinned: c.pinned }"
-          :title="itemHint(c, i)"
-          @mousemove="onItemHover(i, $event)"
-          @click.capture="dismissMenuBeforeItemClick"
-          @click="paste(c)"
-          @contextmenu="openClipMenu(c, $event)"
-        >
-          <div class="body" :class="{ 'image-body': c.kind === 'image' && c.thumb }">
-            <img v-if="c.kind === 'image' && c.thumb" class="thumb" :src="convertFileSrc(c.thumb)" :alt="c.source ? `${c.source} 的缩略图` : '剪贴板图片缩略图'" width="76" height="76" loading="lazy" decoding="async" draggable="false" />
-            <div v-if="c.kind === 'image' && c.thumb" class="image-summary">
-              <span class="image-name" :title="c.source || '剪贴板图片'">{{ c.source || '剪贴板图片' }}</span>
-              <span v-if="c.width && c.height" class="image-dimensions">{{ c.width }} × {{ c.height }}</span>
-            </div>
-            <div v-else-if="c.color" class="hex-preview">
-              <span class="hex-swatch" aria-hidden="true"><span :style="{ backgroundColor: c.color }"></span></span>
-              <span class="hex-value">{{ c.color }}</span>
-            </div>
-            <div v-else class="text">{{ c.preview }}<span v-if="c.truncated" class="more">…</span></div>
-            <div class="item-footer">
-              <div class="meta">
-                <span class="meta-time">{{ timeAgo(c.updatedAt) }}</span>
-                <span class="meta-dot" aria-hidden="true">·</span>
-                <span class="meta-type"><ClipIcon :name="c.kind === 'image' ? 'image' : c.color ? 'palette' : 'file-text'" class="tiny" />{{ c.kind === 'image' ? '图片' : c.color ? 'HEX 色值' : '文本' }}</span>
-                <span v-if="c.pinned" class="meta-flag pin-flag"><ClipIcon name="pin" class="tiny" />置顶</span>
-                <span v-if="scope !== 'group' && groupName(c.groupId)" class="meta-flag group-flag" :title="groupName(c.groupId) ?? ''"><ClipIcon name="folder" class="tiny" /><span class="group-label">{{ groupName(c.groupId) }}</span></span>
+             instead of all of them on every selection move. Date headings are scan-only. -->
+        <template v-for="row in listRows" :key="row.key">
+          <li v-if="row.kind === 'heading'" class="date-heading">{{ row.label }}</li>
+          <li
+            v-else
+            v-memo="[row.clip, row.index, row.index === selected, multiSelect.ids.includes(row.clip.id), scope, groupName(row.clip.groupId), preserveExplorerRename]"
+            class="item"
+            :class="{ selected: row.index === selected, pinned: row.clip.pinned, picked: multiSelect.ids.includes(row.clip.id) }"
+            :data-clip-index="row.index"
+            :title="itemHint(row.clip, row.index)"
+            @mousemove="onItemHover(row.index, $event)"
+            @click.capture="dismissMenuBeforeItemClick"
+            @click="onItemClick(row.clip, row.index, $event)"
+            @contextmenu="openClipMenu(row.clip, $event)"
+          >
+            <div class="body" :class="{ 'image-body': row.clip.kind === 'image' && row.clip.thumb }">
+              <img v-if="row.clip.kind === 'image' && row.clip.thumb" class="thumb" :src="convertFileSrc(row.clip.thumb)" :alt="row.clip.source ? `${row.clip.source} 的缩略图` : '剪贴板图片缩略图'" width="76" height="76" loading="lazy" decoding="async" draggable="false" />
+              <div v-if="row.clip.kind === 'image' && row.clip.thumb" class="image-summary">
+                <span class="image-name" :title="row.clip.source || '剪贴板图片'">{{ row.clip.source || '剪贴板图片' }}</span>
+                <span v-if="row.clip.width && row.clip.height" class="image-dimensions">{{ row.clip.width }} × {{ row.clip.height }}</span>
               </div>
-              <div class="ops">
-                <button v-if="c.kind === 'text'" class="icon-btn sm" title="查看全文 / 编辑" @click.stop="openPreview(c)"><ClipIcon name="eye" /></button>
-                <button
-                  class="icon-btn sm star-op"
-                  :class="{ active: c.favorite }"
-                  :title="c.favorite ? '取消收藏 (Ctrl+S)' : '收藏 (Ctrl+S)'"
-                  :aria-label="c.favorite ? '取消收藏' : '收藏'"
-                  :aria-pressed="c.favorite"
-                  @click.stop="toggleFav(c)"
-                >
-                  <ClipIcon :name="c.favorite ? 'star-fill' : 'star'" />
-                </button>
-                <button class="icon-btn sm more-op" title="更多操作 · 也可右键条目" aria-label="更多操作" @click.stop="openClipMenu(c, $event)"><ClipIcon name="more" /></button>
+              <div v-else-if="row.clip.color" class="hex-preview">
+                <span class="hex-swatch" aria-hidden="true"><span :style="{ backgroundColor: row.clip.color }"></span></span>
+                <span class="hex-value">{{ row.clip.color }}</span>
+              </div>
+              <div v-else class="text">{{ row.clip.preview }}<span v-if="row.clip.truncated" class="more">…</span></div>
+              <div class="item-footer">
+                <div class="meta">
+                  <span class="meta-time">{{ timeAgo(row.clip.updatedAt) }}</span>
+                  <span class="meta-dot" aria-hidden="true">·</span>
+                  <span class="meta-type"><ClipIcon :name="row.clip.kind === 'image' ? 'image' : row.clip.color ? 'palette' : 'file-text'" class="tiny" />{{ row.clip.kind === 'image' ? '图片' : row.clip.color ? 'HEX 色值' : '文本' }}</span>
+                  <span v-if="row.clip.pinned" class="meta-flag pin-flag"><ClipIcon name="pin" class="tiny" />置顶</span>
+                  <span v-if="scope !== 'group' && groupName(row.clip.groupId)" class="meta-flag group-flag" :title="groupName(row.clip.groupId) ?? ''"><ClipIcon name="folder" class="tiny" /><span class="group-label">{{ groupName(row.clip.groupId) }}</span></span>
+                </div>
+                <div class="ops">
+                  <button class="icon-btn sm" :title="row.clip.kind === 'image' ? '预览图片 (空格)' : '查看全文 / 编辑 (空格)'" @click.stop="openPreview(row.clip)"><ClipIcon name="eye" /></button>
+                  <button
+                    class="icon-btn sm star-op"
+                    :class="{ active: row.clip.favorite }"
+                    :title="row.clip.favorite ? `取消收藏 (${modShortcut('S')})` : `收藏 (${modShortcut('S')})`"
+                    :aria-label="row.clip.favorite ? '取消收藏' : '收藏'"
+                    :aria-pressed="row.clip.favorite"
+                    @click.stop="toggleFav(row.clip)"
+                  >
+                    <ClipIcon :name="row.clip.favorite ? 'star-fill' : 'star'" />
+                  </button>
+                  <button class="icon-btn sm more-op" title="更多操作 · 也可右键条目" aria-label="更多操作" @click.stop="openClipMenu(row.clip, $event)"><ClipIcon name="more" /></button>
+                </div>
               </div>
             </div>
-          </div>
-        </li>
+          </li>
+        </template>
         <li v-if="!clips.length" class="empty">
           <ClipIcon :name="scope === 'fav' ? 'star' : scope === 'group' ? 'folder' : 'clipboard'" class="empty-icon" />
           <p>
             {{
-              query
+              query || kindFilter !== "all"
                 ? "没有匹配的内容"
                 : scope === "fav"
                   ? "还没有收藏，划到条目上点星标"
@@ -1012,16 +1346,17 @@ onUnmounted(() => {
     </div>
 
     <div v-if="clipMenu.open && menuClip" class="menu menu-surface clip-menu" :style="{ left: clipMenu.x + 'px', top: clipMenu.y + 'px' }" @click.stop @mouseover="onClipMenuHover">
-      <button class="menu-row" @click="menuAction('copy')"><ClipIcon name="copy" /><span class="menu-text">仅复制</span><span class="menu-shortcut">Shift+Enter</span></button>
-      <button v-if="menuClip.kind === 'text'" class="menu-row" @click="menuAction('preview')"><ClipIcon name="eye" /><span class="menu-text">查看 / 编辑</span></button>
+      <button class="menu-row" @click="menuAction('copy')"><ClipIcon name="copy" /><span class="menu-text">仅复制</span><span class="menu-shortcut">{{ shiftShortcut('Enter') }}</span></button>
+      <button class="menu-row" @click="menuAction('preview')"><ClipIcon name="eye" /><span class="menu-text">{{ menuClip.kind === 'image' ? '预览' : '查看 / 编辑' }}</span><span class="menu-shortcut">空格</span></button>
+      <button v-if="menuClip.kind === 'image'" class="menu-row" @click="menuAction('save')"><ClipIcon name="download" /><span class="menu-text">另存为文件</span></button>
       <div class="menu-divider"></div>
-      <button v-if="menuClip.kind === 'text'" class="menu-row" :class="{ open: openSubmenu === 'send' }" data-submenu="send" aria-haspopup="menu" :aria-expanded="openSubmenu === 'send'" @click="showSubmenu('send', $event.currentTarget as HTMLElement, true)"><ClipIcon name="send" /><span class="menu-text">发送到设备</span><ClipIcon name="chevron" class="menu-chevron" /></button>
+      <button v-if="menuClip.kind === 'text' || menuClip.kind === 'image'" class="menu-row" :class="{ open: openSubmenu === 'send' }" data-submenu="send" aria-haspopup="menu" :aria-expanded="openSubmenu === 'send'" @click="showSubmenu('send', $event.currentTarget as HTMLElement, true)"><ClipIcon name="send" /><span class="menu-text">发送到设备</span><ClipIcon name="chevron" class="menu-chevron" /></button>
       <button class="menu-row" :class="{ open: openSubmenu === 'move' }" data-submenu="move" aria-haspopup="menu" :aria-expanded="openSubmenu === 'move'" @click="showSubmenu('move', $event.currentTarget as HTMLElement, true)"><ClipIcon name="folder" /><span class="menu-text">移动到分组</span><ClipIcon name="chevron" class="menu-chevron" /></button>
       <div class="menu-divider"></div>
-      <button class="menu-row" @click="menuAction('favorite')"><ClipIcon :name="menuClip.favorite ? 'star-fill' : 'star'" /><span class="menu-text">{{ menuClip.favorite ? '取消收藏' : '收藏' }}</span></button>
-      <button class="menu-row" @click="menuAction('pin')"><ClipIcon name="pin" /><span class="menu-text">{{ menuClip.pinned ? '取消置顶' : '置顶' }}</span></button>
+      <button class="menu-row" @click="menuAction('favorite')"><ClipIcon :name="menuClip.favorite ? 'star-fill' : 'star'" /><span class="menu-text">{{ menuClip.favorite ? '取消收藏' : '收藏' }}</span><span class="menu-shortcut">{{ modShortcut('S') }}</span></button>
+      <button class="menu-row" @click="menuAction('pin')"><ClipIcon name="pin" /><span class="menu-text">{{ menuClip.pinned ? '取消置顶' : '置顶' }}</span><span class="menu-shortcut">{{ modShortcut('P') }}</span></button>
       <div class="menu-divider"></div>
-      <button class="menu-row danger" @click="menuAction('delete')"><ClipIcon name="trash" /><span class="menu-text">删除条目</span></button>
+      <button class="menu-row danger" @click="menuAction('delete')"><ClipIcon name="trash" /><span class="menu-text">删除条目</span><span class="menu-shortcut">{{ modShortcut('D') }}</span></button>
     </div>
     <div v-if="moveMenu.open" class="menu menu-surface move-menu" :style="{ left: moveMenu.x + 'px', top: moveMenu.y + 'px' }" @click.stop @mouseenter="keepSubmenu">
       <div class="menu-label">移动到</div>
@@ -1037,7 +1372,7 @@ onUnmounted(() => {
       </template>
     </div>
     <div v-if="sendMenu.open" class="menu menu-surface send-menu" :style="{ left: sendMenu.x + 'px', top: sendMenu.y + 'px' }" role="group" aria-label="发送到设备" tabindex="-1" @click.stop @mouseenter="keepSubmenu">
-      <div class="menu-label">发送文本到</div>
+      <div class="menu-label">{{ sendMenu.kind === 'image' ? '发送图片到' : '发送文本到' }}</div>
       <div v-if="sendLoading" class="send-menu-message" role="status">正在读取设备…</div>
       <template v-else>
         <button v-for="peer in lanPeers" :key="peer.address" class="menu-row" :disabled="sendBusy" :title="`${peer.name} · ${peer.address}`" :aria-label="`发送到 ${peer.name}（${peer.address}）`" @click="sendTo(peer)"><ClipIcon name="send" /><span class="menu-text">{{ peer.name }}</span></button>
@@ -1076,20 +1411,42 @@ onUnmounted(() => {
       </div>
     </form>
 
-    <section v-if="previewClip" class="preview-panel" aria-label="文本全文预览">
+    <AccessibilityGuide
+      v-if="accessibilityGuide"
+      :mode="accessibilityMode"
+      :trusted="accessibilityTrusted"
+      :hint="accessibilityHint"
+      :busy="accessibilityBusy"
+      @open-settings="openAccessibilitySettings"
+      @confirm="confirmAccessibility"
+      @dismiss="dismissAccessibility"
+      @finish="finishAccessibility"
+    />
+
+    <section v-if="previewClip" class="preview-panel" :aria-label="previewClip.kind === 'image' ? '图片预览' : '文本全文预览'">
       <header class="preview-head">
         <button class="icon-btn" title="返回 (Esc)" @click="closePreview"><ClipIcon name="back" /></button>
-        <div class="preview-title"><ClipIcon :name="editing ? 'edit' : 'file-text'" />{{ editing ? '编辑文本' : '文本全文' }}</div>
-        <span class="preview-size">{{ (editing ? draftText.length : fullText.length).toLocaleString() }} 字符</span>
+        <div class="preview-title">
+          <ClipIcon :name="previewClip.kind === 'image' ? 'image' : editing ? 'edit' : 'file-text'" />
+          {{ previewClip.kind === 'image' ? (previewClip.source || '图片预览') : editing ? '编辑文本' : '文本全文' }}
+        </div>
+        <span class="preview-size">{{ previewSizeLabel(previewClip) }}</span>
         <button class="icon-btn" :title="editing ? '取消编辑' : '关闭'" @click="closePreview"><ClipIcon name="close" /></button>
       </header>
       <div v-if="previewError" class="preview-error">{{ previewError }}</div>
-      <div v-if="previewBusy && !fullText" class="preview-loading">正在读取全文…</div>
-      <textarea v-else-if="editing" ref="editorEl" v-model="draftText" class="preview-editor" spellcheck="false"></textarea>
-      <pre v-else class="preview-content">{{ fullText }}</pre>
+      <div v-if="imageSaveError" class="preview-error" role="alert">保存失败：{{ imageSaveError }}</div>
+      <div v-if="previewClip.kind === 'image'" class="preview-image-wrap">
+        <img v-if="previewImageSrc && !previewError" class="preview-image" :src="previewImageSrc" :alt="previewClip.source || '剪贴板图片'" draggable="false" />
+      </div>
+      <template v-else>
+        <div v-if="previewBusy && !fullText" class="preview-loading">正在读取全文…</div>
+        <textarea v-else-if="editing" ref="editorEl" v-model="draftText" class="preview-editor" spellcheck="false"></textarea>
+        <pre v-else class="preview-content">{{ fullText }}</pre>
+      </template>
       <footer class="preview-foot">
-        <span>{{ editing ? 'Ctrl+Enter 保存 · Esc 取消' : '可选择并复制任意段落' }}</span>
-        <button v-if="editing" class="preview-action" :disabled="previewBusy" @click="savePreview">保存</button>
+        <span>{{ previewFootHint(previewClip) }}</span>
+        <button v-if="previewClip.kind === 'image'" class="preview-action" :disabled="previewBusy || !!previewError" @click="saveClipAsFile(previewClip)">另存为</button>
+        <button v-else-if="editing" class="preview-action" :disabled="previewBusy" @click="savePreview">保存</button>
         <button v-else class="preview-action" :disabled="previewBusy || !!previewError" @click="startEditing">编辑</button>
       </footer>
     </section>
@@ -1219,6 +1576,27 @@ onUnmounted(() => {
   width: 24px;
   height: 24px;
 }
+.kind-filters {
+  display: flex;
+  gap: 4px;
+  margin-top: 8px;
+}
+.kind-chip {
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+.kind-chip:hover { background: var(--hover); color: var(--text); }
+.kind-chip.active {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent);
+}
+.kind-chip.active:hover { background: var(--accent-soft); }
 .pause-banner,
 .notice-banner {
   display: flex;
@@ -1237,6 +1615,26 @@ onUnmounted(() => {
 }
 .pause-banner svg { width: 12px; height: 12px; }
 .notice-banner { background: var(--surface-2); color: var(--text-2); }
+.multi-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+.multi-bar span { flex: 1; }
+.multi-bar-clear {
+  padding: 2px 8px;
+  border-radius: var(--r-sm);
+  color: var(--accent);
+  font-weight: 600;
+}
+.multi-bar-clear:hover { background: var(--surface); }
 
 .list {
   flex: 1;
@@ -1247,6 +1645,14 @@ onUnmounted(() => {
   padding: 6px 9px 56px;
   scroll-padding-bottom: 56px;
 }
+.date-heading {
+  padding: 8px 6px 4px;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.date-heading:first-child { padding-top: 2px; }
 .back-to-top {
   position: absolute;
   right: 18px;
@@ -1291,6 +1697,23 @@ onUnmounted(() => {
   background: var(--selected);
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent-soft);
+}
+.item.picked {
+  background: var(--accent-soft);
+}
+.item.picked.selected {
+  background: var(--selected);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.item.picked::after {
+  content: "";
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 .item::before {
   content: "";
@@ -1588,4 +2011,24 @@ onUnmounted(() => {
   font-size: var(--fs-sm);
 }
 .preview-loading { color: var(--muted); }
+.preview-image-wrap {
+  flex: 1;
+  min-height: 0;
+  margin: 10px;
+  padding: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: repeating-conic-gradient(var(--hover) 0% 25%, transparent 0% 50%) 0 0 / 16px 16px;
+}
+.preview-image {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: var(--r-sm);
+}
 </style>

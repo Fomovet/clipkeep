@@ -17,6 +17,8 @@ export interface Clip {
   /** Set when the whole text is one hex colour such as `#2563eb`. */
   color: string | null;
   thumb: string | null;
+  /** Absolute path to the original PNG, when the clip is an image. */
+  image: string | null;
 }
 
 export interface Group {
@@ -55,6 +57,13 @@ export interface StorageUsage {
   databaseBytes: number;
 }
 
+/** macOS Accessibility onboarding. `applies` is false on Windows. */
+export interface MacosSetupState {
+  applies: boolean;
+  trusted: boolean;
+  showGuide: boolean;
+}
+
 export interface LanPeer {
   name: string;
   address: string;
@@ -64,14 +73,19 @@ export interface LanState {
   receiveEnabled: boolean;
   localCodes: { address: string; code: string }[];
   peers: LanPeer[];
+  /** PNG payload cap, in bytes. */
+  maxImageBytes: number;
 }
 
 export type Scope = "all" | "fav" | "group";
 
+export type KindFilter = "all" | "text" | "image" | "color";
+
 export const api = {
-  listClips: (scope: Scope, groupId: number | null, query: string) =>
-    invoke<Clip[]>("list_clips", { scope, groupId, query }),
+  listClips: (scope: Scope, groupId: number | null, query: string, kind: KindFilter = "all") =>
+    invoke<Clip[]>("list_clips", { scope, groupId, query, kind }),
   getClipText: (id: number) => invoke<string>("get_clip_text", { id }),
+  saveClipImage: (id: number) => invoke<string | null>("save_clip_image", { id }),
   updateClipText: (id: number, text: string) => invoke<void>("update_clip_text", { id, text }),
   getCapturePaused: () => invoke<boolean>("get_capture_paused"),
   toggleCapturePaused: () => invoke<boolean>("toggle_capture_paused"),
@@ -114,6 +128,10 @@ export const api = {
   downloadUpdate: () => invoke<void>("download_update"),
   cancelUpdate: () => invoke<void>("cancel_update"),
   installUpdate: () => invoke<void>("install_update"),
+  macosSetupState: () => invoke<MacosSetupState>("macos_setup_state"),
+  openAccessibilitySettings: () => invoke<void>("open_accessibility_settings"),
+  dismissAccessibilityGuide: () => invoke<void>("dismiss_accessibility_guide"),
+  setAccessibilityGuideHold: (hold: boolean) => invoke<void>("set_accessibility_guide_hold", { hold }),
 };
 
 export { getVersion };

@@ -311,6 +311,18 @@ impl ImageStore {
         })
     }
 
+    /// Full-size original, when the file is present and not behind a reparse point.
+    pub fn original_file_path(&self, file: &str) -> Option<PathBuf> {
+        file_hash(file).and_then(|hash| {
+            let path = self.existing_path(&self.originals, hash);
+            (!is_reparse_point(&self.originals)
+                && !is_reparse_point(path.parent().unwrap_or(&self.originals))
+                && !is_reparse_point(&path)
+                && path.is_file())
+            .then_some(path)
+        })
+    }
+
     pub fn remove(&self, file: &str) {
         let Some(hash) = file_hash(file) else { return };
         let original = self.original_path(hash);
@@ -446,6 +458,19 @@ mod tests {
         let digest = hash(&image);
         let saved = store.write(&image, &digest).unwrap();
         assert_eq!(store.load(&saved.file).unwrap().pixels, image.pixels);
+        // The filename accessor is distinct from the internal hash-path constructor.
+        // Cover both the sharded path and the legacy fallback used by old histories.
+        assert_eq!(
+            store.original_file_path(&saved.file),
+            Some(store.original_path(&digest))
+        );
+        assert!(store.original_file_path(&digest).is_none());
+        assert!(store.original_file_path("../private.png").is_none());
+        assert!(
+            store
+                .original_file_path(&format!("{}.png", "f".repeat(64)))
+                .is_none()
+        );
         assert_eq!(
             decode_png(&std::fs::read(store.thumb_path(&saved.file).unwrap()).unwrap())
                 .unwrap()
@@ -461,10 +486,15 @@ mod tests {
         std::fs::rename(store.thumb_path_for_hash(&digest), &legacy_thumb).unwrap();
         assert_eq!(store.load(&saved.file).unwrap().pixels, image.pixels);
         assert_eq!(store.thumb_path(&saved.file), Some(legacy_thumb.clone()));
+        assert_eq!(
+            store.original_file_path(&saved.file),
+            Some(legacy_original.clone())
+        );
         assert!(!store.png_bytes(&saved.file).unwrap().is_empty());
         store.remove(&saved.file);
         assert!(!store.original_path(&digest).exists());
         assert!(!legacy_original.exists());
+        assert!(store.original_file_path(&saved.file).is_none());
         assert!(!legacy_thumb.exists());
         std::fs::remove_dir(store.originals).unwrap();
         std::fs::remove_dir(store.thumbs).unwrap();

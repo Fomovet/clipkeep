@@ -2,7 +2,8 @@
 //!
 //! Global hotkeys use Carbon's `RegisterEventHotKey` (via `global-hotkey`), which works without
 //! Accessibility permission. Synthesising Cmd+V with `CGEvent` *does* require Accessibility
-//! permission, so the first paste asks macOS to show the standard consent dialog.
+//! permission. The first launch asks macOS to show the standard consent dialog; a paste asks
+//! again only when this process has not asked yet.
 
 #[path = "position.rs"]
 mod position;
@@ -24,6 +25,7 @@ use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -243,9 +245,17 @@ unsafe extern "C" {
     fn AXIsProcessTrustedWithOptions(options: *const c_void) -> u8;
 }
 
-/// Shows the system consent dialog once, the first time a synthetic key event is needed.
-fn request_accessibility() {
-    if unsafe { AXIsProcessTrusted() } != 0 {
+pub(crate) fn accessibility_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+/// Asks macOS to show the Accessibility consent dialog once per process.
+///
+/// First launch calls this so the prompt is not delayed until a paste. A paste calls it
+/// again only if this process has not asked yet, which is what happens after the user
+/// postpones the in-app guide and later tries to paste.
+pub(crate) fn request_accessibility() {
+    if accessibility_trusted() {
         return;
     }
     if ACCESSIBILITY_ASKED.swap(true, Ordering::Relaxed) {
@@ -263,6 +273,31 @@ fn request_accessibility() {
         "clipkeep needs Accessibility permission to paste with Cmd+V: \
          System Settings > Privacy & Security > Accessibility"
     );
+}
+
+fn open_settings_url(url: &str) -> std::io::Result<()> {
+    let status = Command::new("open").arg(url).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "无法打开辅助功能设置（{status}）"
+        )))
+    }
+}
+
+/// Opens Privacy & Security on the Accessibility pane.
+///
+/// macOS 13 and later use System Settings. Earlier releases still use System Preferences.
+/// If macOS rejects the current address, use the older one that selects Accessibility.
+pub(crate) fn open_accessibility_settings() -> std::io::Result<()> {
+    const MODERN: &str = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility";
+    const LEGACY: &str =
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+    if objc2::available!(macos = 13.0) && open_settings_url(MODERN).is_ok() {
+        return Ok(());
+    }
+    open_settings_url(LEGACY)
 }
 
 /// No Win32 foreground hook on macOS; the focus session tracker remembers the frontmost app.
@@ -283,7 +318,7 @@ pub fn hide_no_activate(_hwnd: ()) {}
 
 /// Synthesise Cmd+V. `focus::restore` has already put the original application back in front.
 pub fn can_send_paste() -> bool {
-    if unsafe { AXIsProcessTrusted() } == 0 {
+    if !accessibility_trusted() {
         log_diagnostic("paste-accessibility-denied");
         request_accessibility();
         return false;

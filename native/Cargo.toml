@@ -23,7 +23,7 @@ tauri-plugin-autostart = "2.7.0"
 tauri-plugin-single-instance = "2.5.3"
 arboard = "3.6.1"
 clipboard-master = "4.0.0"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 blake3 = "1.5"
 tauri-plugin-dialog = "2.8.2"
