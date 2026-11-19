@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { api, type LanState, type Settings, type SettingsView, type StorageUsage, type Theme } from "../api";
+import { api, type LanState, type MacosSetupState, type Settings, type SettingsView, type StorageUsage, type Theme } from "../api";
 import { formatSize, useUpdate } from "../update";
 import ClipIcon from "./ClipIcon.vue";
+import { modShortcut, shiftShortcut } from "../platform";
 
-defineEmits<{ back: [] }>();
+defineEmits<{ back: []; showAccessibilityGuide: [] }>();
 
 const themeOptions: { id: Theme; label: string }[] = [
   { id: "system", label: "跟随系统" },
@@ -18,7 +19,12 @@ const s = computed(() => view.value?.settings);
 // Unknown until the task lookup returns, which is slower than the settings: rendering the switch
 // early would animate it from off to its real state every time the page opens.
 const autostart = ref<boolean | null>(null);
+const accessibility = ref<MacosSetupState | null>(null);
 const lan = ref<LanState | null>(null);
+const lanImageLimit = computed(() => {
+  const bytes = lan.value?.maxImageBytes ?? 16 * 1024 * 1024;
+  return `${Math.round(bytes / (1024 * 1024))} MB`;
+});
 const peerName = ref("");
 const peerCode = ref("");
 const lanBusy = ref(false);
@@ -251,6 +257,24 @@ async function confirmClear() {
 
 const hotkeyLabel = computed(() => view.value?.hotkeys.find((h) => h.id === s.value?.hotkey)?.label ?? "");
 
+async function refreshAccessibility() {
+  try {
+    const state = await api.macosSetupState();
+    if (!disposed) accessibility.value = state.applies ? state : null;
+  } catch (e) {
+    if (!disposed) error.value = `读取辅助功能状态失败：${String(e)}`;
+  }
+}
+
+async function openAccessibilitySettings() {
+  error.value = "";
+  try {
+    await api.openAccessibilitySettings();
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
 async function refreshLan() {
   try {
     const state = await api.getLanState();
@@ -260,8 +284,14 @@ async function refreshLan() {
   }
 }
 
+function onWindowFocus() {
+  void refreshAccessibility();
+}
+
 onMounted(() => {
+  window.addEventListener("focus", onWindowFocus);
   void refreshStorageUsage();
+  void refreshAccessibility();
   void (async () => {
     const [settingsResult, autostartResult, lanResult] = await Promise.allSettled([
       load(), api.getAutostart(), api.getLanState(),
@@ -287,6 +317,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   disposed = true;
+  window.removeEventListener("focus", onWindowFocus);
   window.clearTimeout(clearTimer);
   window.clearTimeout(noticeTimer);
   window.clearTimeout(storageTimer);
@@ -331,6 +362,16 @@ onUnmounted(() => {
           </div>
           <input type="checkbox" class="switch" :checked="s.hideDockIcon" @change="save({ hideDockIcon: !s.hideDockIcon })" />
         </label>
+        <div v-if="accessibility?.applies" class="row">
+          <div class="label">
+            <div class="name">辅助功能{{ accessibility.trusted ? "（已允许）" : "（未允许）" }}</div>
+            <div class="desc">自动粘贴会模拟 ⌘V。请在「系统设置 → 隐私与安全性 → 辅助功能」中允许 clipkeep。若之后关掉开关，点一条记录会再次显示授权说明。</div>
+          </div>
+          <div class="accessibility-actions">
+            <button type="button" class="btn" :class="{ accent: !accessibility.trusted }" @click="openAccessibilitySettings">打开系统设置</button>
+            <button v-if="!accessibility.trusted" type="button" class="btn" @click="$emit('showAccessibilityGuide')">查看说明</button>
+          </div>
+        </div>
         <label class="row">
           <div class="label">
             <div class="name">开机自启</div>
@@ -421,8 +462,8 @@ onUnmounted(() => {
       <div v-if="lan" class="card">
         <label class="row">
           <div class="label">
-            <div class="name">接收其他设备的文本</div>
-            <div class="desc">默认关闭。开启后，同一局域网内持有配对码的设备可手动发送文本，收到后只存入本机历史，不覆盖当前剪贴板。</div>
+            <div class="name">接收其他设备的文本和图片</div>
+            <div class="desc">默认关闭。开启后，同一局域网内持有配对码的设备可手动发送文本和已记录的图片，收到后只存入本机历史，不覆盖当前剪贴板。图片不超过 {{ lanImageLimit }}；只支持文本的旧版本会拒绝图片。</div>
           </div>
           <input type="checkbox" class="switch" :checked="lan.receiveEnabled" :disabled="lanBusy" @change="toggleLanReceive" />
         </label>
@@ -460,7 +501,7 @@ onUnmounted(() => {
         <label class="row">
           <div class="label">
             <div class="name">全局快捷键{{ s.hotkeyEnabled ? `（${hotkeyLabel}）` : "" }}</div>
-            <div class="desc">默认快捷键可能被系统面板占用；遇到冲突可在下方改选其他组合。clipkeep 不修改系统剪贴板设置；关闭快捷键后可从托盘打开。在 macOS 上粘贴需要授予「辅助功能」权限。</div>
+            <div class="desc">默认快捷键可能被系统面板占用；遇到冲突可在下方改选其他组合。clipkeep 不修改系统剪贴板设置；关闭快捷键后可从托盘打开。<template v-if="view.supportsDockVisibility"> 自动粘贴需要「辅助功能」权限，首次打开时会说明如何授权。</template><template v-else>在 macOS 上粘贴需要授予「辅助功能」权限。</template></div>
           </div>
           <input type="checkbox" class="switch" :checked="s.hotkeyEnabled" @change="save({ hotkeyEnabled: !s.hotkeyEnabled })" />
         </label>
@@ -471,8 +512,8 @@ onUnmounted(() => {
           </select>
         </div>
         <p class="hint">
-          <kbd>↑</kbd><kbd>↓</kbd> 选择 · <kbd>Enter</kbd> 粘贴 · <kbd>Shift+Enter</kbd> 仅复制 · <kbd>Ctrl+1–9</kbd> 快速粘贴 ·
-          <kbd>Ctrl+P</kbd> 置顶 · <kbd>Ctrl+S</kbd> 收藏 · <kbd>Ctrl+D</kbd> 删除 · <kbd>Tab</kbd> 切分组 · <kbd>Esc</kbd> 关闭
+          <kbd>↑</kbd><kbd>↓</kbd> 选择 · <kbd>Enter</kbd> 粘贴 · <kbd>{{ shiftShortcut("Enter") }}</kbd> 仅复制 · <kbd>空格</kbd> 预览 · <kbd>{{ modShortcut("1–9") }}</kbd> 快速粘贴 ·
+          <kbd>{{ modShortcut("P") }}</kbd> 置顶 · <kbd>{{ modShortcut("S") }}</kbd> 收藏 · <kbd>{{ modShortcut("D") }}</kbd> 删除 · <kbd>Tab</kbd> 切分组 · <kbd>Esc</kbd> 关闭
         </p>
       </div>
 
@@ -550,7 +591,7 @@ onUnmounted(() => {
         </template>
       </div>
 
-      <p class="foot">clipkeep · 数据默认只保存在本机 · 局域网文本传送需手动启用</p>
+      <p class="foot">clipkeep · 数据默认只保存在本机 · 局域网传送需手动启用</p>
     </div>
   </div>
 </template>
@@ -680,6 +721,13 @@ h3.danger-heading { color: var(--danger); }
 .update-row .label { flex: 1; min-width: 0; }
 .update-row .storage-track { margin-top: 8px; }
 .update-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.accessibility-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  flex-shrink: 0;
+}
 .update-dot {
   display: inline-block;
   width: 7px;

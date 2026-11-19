@@ -58,7 +58,10 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$APPDATA/thumbs/**/*"
+          "$APPDATA/thumbs/*",
+          "$APPDATA/thumbs/**/*",
+          "$APPDATA/images/*",
+          "$APPDATA/images/**/*"
         ]
       }
     }

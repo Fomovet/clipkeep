@@ -1,0 +1,11 @@
+# Linux-only test harness: compile the real database module without the desktop shell.
+[package]
+name = "clipkeep-db-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+blake3 = "1.5"
+rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
+serde = { version = "1", features = ["derive"] }

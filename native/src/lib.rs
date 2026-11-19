@@ -32,6 +32,9 @@ mod clipboard;
 #[path = "macos/instances.rs"]
 mod instances;
 #[cfg(target_os = "macos")]
+#[path = "macos/onboarding.rs"]
+mod macos_onboarding;
+#[cfg(target_os = "macos")]
 #[path = "macos/recover.rs"]
 mod recover;
 #[cfg(target_os = "macos")]
@@ -41,7 +44,7 @@ mod win;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use clipboard::Captured;
-use db::{Group, NewClip, RawClip, Scope};
+use db::{Group, KindFilter, NewClip, RawClip, Scope};
 use images::ImageStore;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -287,14 +290,24 @@ fn list_clips(
     scope: String,
     group_id: Option<i64>,
     query: String,
+    kind: Option<String>,
 ) -> CmdResult<Vec<db::Clip>> {
-    let mut clips =
-        db::list(&*core.conn()?, scope_of(&scope, group_id), query.trim()).map_err(to_err)?;
+    let mut clips = db::list_with_kind(
+        &*core.conn()?,
+        scope_of(&scope, group_id),
+        query.trim(),
+        KindFilter::parse(kind.as_deref().unwrap_or("all")),
+    )
+    .map_err(to_err)?;
     for clip in &mut clips {
         if let Some(file) = &clip.file {
             clip.thumb = core
                 .images
                 .thumb_path(file)
+                .map(|path| path.to_string_lossy().into_owned());
+            clip.image = core
+                .images
+                .original_file_path(file)
                 .map(|path| path.to_string_lossy().into_owned());
         }
     }
@@ -310,6 +323,37 @@ fn get_clip_text(core: State<Core>, id: i64) -> CmdResult<String> {
         return Err("只能预览文本条目".into());
     }
     Ok(text)
+}
+
+/// Offers a save-file dialog and writes the original PNG. `None` if the user cancelled.
+#[tauri::command]
+async fn save_clip_image(app: AppHandle, id: i64) -> CmdResult<Option<String>> {
+    let (file, default_name) = {
+        let core = app.state::<Core>();
+        let conn = core.conn()?;
+        let (kind, content) = db::get(&conn, id).map_err(to_err)?.ok_or("条目不存在")?;
+        if kind != db::KIND_IMAGE {
+            return Err("只能保存图片条目".into());
+        }
+        let source = db::source(&conn, id).ok().flatten();
+        (content, paste_file_name(source.as_deref()))
+    };
+    let Some(path) = app
+        .dialog()
+        .file()
+        .add_filter("PNG 图片", &["png"])
+        .set_file_name(&default_name)
+        .blocking_save_file()
+    else {
+        return Ok(None);
+    };
+    let path = path.into_path().map_err(to_err)?;
+    let bytes = {
+        let core = app.state::<Core>();
+        core.images.png_bytes(&file).map_err(to_err)?
+    };
+    std::fs::write(&path, bytes).map_err(to_err)?;
+    Ok(Some(path.display().to_string()))
 }
 
 #[tauri::command]
@@ -384,13 +428,20 @@ fn copy_lan_code(core: State<Core>, address: String) -> CmdResult<()> {
 async fn send_clip_to_peer(app: AppHandle, id: i64, address: String) -> CmdResult<()> {
     tauri::async_runtime::spawn_blocking(move || {
         let core = app.state::<Core>();
-        let (kind, text) = db::get(&*core.conn()?, id)
+        let (kind, content) = db::get(&*core.conn()?, id)
             .map_err(to_err)?
             .ok_or("条目不存在")?;
-        if kind != db::KIND_TEXT {
-            return Err("仅支持传送文本".into());
+        match kind.as_str() {
+            db::KIND_TEXT => core.lan.send_text(&address, &content),
+            db::KIND_IMAGE => {
+                let png = core
+                    .images
+                    .png_bytes(&content)
+                    .map_err(|e| format!("读取图片失败：{e}"))?;
+                core.lan.send_image(&address, &png)
+            }
+            _ => Err("仅支持传送文本和图片".into()),
         }
-        core.lan.send_text(&address, &text)
     })
     .await
     .map_err(to_err)?
@@ -724,6 +775,79 @@ fn open_release_page() -> CmdResult<()> {
         .spawn()
         .map(drop)
         .map_err(to_err)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MacosSetupState {
+    /// False on Windows. The guide is never shown there.
+    applies: bool,
+    trusted: bool,
+    /// First launch, or a later launch before the user postpones, while Accessibility is off.
+    show_guide: bool,
+}
+
+#[tauri::command]
+fn macos_setup_state(core: State<Core>) -> MacosSetupState {
+    #[cfg(target_os = "macos")]
+    {
+        let trusted = win::accessibility_trusted();
+        // Granted permission forgets a postponement, so revoking it can show the guide again.
+        if trusted
+            && macos_onboarding::dismissed(&core.data_dir)
+            && let Err(error) = macos_onboarding::clear_dismissal(&core.data_dir)
+        {
+            eprintln!("clearing accessibility guide postponement failed: {error}");
+        }
+        let dismissed = macos_onboarding::dismissed(&core.data_dir);
+        MacosSetupState {
+            applies: true,
+            trusted,
+            show_guide: macos_onboarding::should_show_guide(trusted, dismissed),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = core;
+        MacosSetupState {
+            applies: false,
+            trusted: true,
+            show_guide: false,
+        }
+    }
+}
+
+#[tauri::command]
+fn open_accessibility_settings() -> CmdResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        win::open_accessibility_settings().map_err(to_err)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("仅 macOS 需要辅助功能权限".into())
+    }
+}
+
+#[tauri::command]
+fn dismiss_accessibility_guide(core: State<Core>) -> CmdResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_onboarding::dismiss(&core.data_dir).map_err(|error| format!("无法保存选择：{error}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = core;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn set_accessibility_guide_hold(hold: bool) {
+    #[cfg(target_os = "macos")]
+    macos_onboarding::set_hold(hold);
+    #[cfg(not(target_os = "macos"))]
+    let _ = hold;
 }
 
 #[tauri::command]
@@ -1958,6 +2082,17 @@ fn show_main(app: &AppHandle) {
         return;
     }
     win::log_diagnostic("show-main-begin");
+    #[cfg(target_os = "macos")]
+    let preserve_editor = {
+        // Re-activating a panel with an open guide must keep its original paste target.
+        let resuming_guide =
+            WINDOW_VISIBLE.load(Ordering::Relaxed) && macos_onboarding::hold_open();
+        if macos_accessibility_guide_pending(app) {
+            macos_onboarding::set_hold(true);
+        }
+        !resuming_guide && focus::begin_session()
+    };
+    #[cfg(windows)]
     let preserve_editor = focus::begin_session();
     hide_tray_menu_window(app);
     FOCUS_EPOCH.fetch_add(1, Ordering::Relaxed);
@@ -2171,14 +2306,24 @@ fn on_window_moved(app: &AppHandle, pos: PhysicalPosition<i32>) {
     }
 }
 
-/// Pinned (keep_on_blur) or mid-drag: don't auto-hide.
+/// Pinned (keep_on_blur), mid-drag, or the macOS first-run guide: don't auto-hide.
 fn should_keep_open(app: &AppHandle) -> bool {
+    #[cfg(target_os = "macos")]
+    if macos_onboarding::hold_open() {
+        return true;
+    }
     if db::now_ms() < SUPPRESS_HIDE_UNTIL.load(Ordering::Relaxed) {
         return true;
     }
     app.try_state::<Core>()
         .map(|c| c.settings().keep_on_blur)
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_accessibility_guide_pending(app: &AppHandle) -> bool {
+    app.try_state::<Core>()
+        .is_some_and(|core| macos_onboarding::should_present(&core.data_dir))
 }
 
 fn on_main_focus_changed(app: &AppHandle, focused: bool) {
@@ -2204,22 +2349,32 @@ fn on_main_focus_changed(app: &AppHandle, focused: bool) {
         let pinned = app
             .try_state::<Core>()
             .is_some_and(|core| core.settings().keep_on_blur);
-        if pinned {
-            if focus::foreground_changed() {
-                if let Some(window) = main_window(app) {
-                    if let Err(error) = window.set_focusable(false) {
-                        win::log_diagnostic(&format!("set-nonfocusable-failed {error}"));
-                        hide_main(app);
-                        return;
+        // The Accessibility guide stays open while System Settings is frontmost. Do not
+        // cancel the session, and do not follow that app: on macOS foreground_changed()
+        // rewrites the paste target even though it returns false. A later click must
+        // still paste into the application that was frontmost when the panel opened.
+        #[cfg(target_os = "macos")]
+        let follow_foreground = !macos_onboarding::hold_open();
+        #[cfg(not(target_os = "macos"))]
+        let follow_foreground = true;
+        if follow_foreground {
+            if pinned {
+                if focus::foreground_changed() {
+                    if let Some(window) = main_window(app) {
+                        if let Err(error) = window.set_focusable(false) {
+                            win::log_diagnostic(&format!("set-nonfocusable-failed {error}"));
+                            hide_main(app);
+                            return;
+                        }
+                        PRESERVE_EDITOR_MODE.store(true, Ordering::Relaxed);
+                        let _ = window.emit("rename-safe-mode-changed", true);
+                        watch_preserved_editor(app);
                     }
-                    PRESERVE_EDITOR_MODE.store(true, Ordering::Relaxed);
-                    let _ = window.emit("rename-safe-mode-changed", true);
-                    watch_preserved_editor(app);
+                    return;
                 }
-                return;
+            } else {
+                focus::cancel();
             }
-        } else {
-            focus::cancel();
         }
     }
     if !should_keep_open(app) {
@@ -2441,12 +2596,36 @@ pub fn run() {
             }
             let to_tray = recover::resume_in_tray(&handle.state::<Core>().data_dir)
                 .unwrap_or_else(|| std::env::args().any(|a| a == AUTOSTART_ARG));
-            if !to_tray {
+            // Accessibility is required for paste, but the system dialog used to wait until
+            // the first paste. Show the guide on first launch even when this process was
+            // started hidden (logon or WebView recovery).
+            #[cfg(target_os = "macos")]
+            let present_accessibility_guide = macos_accessibility_guide_pending(&handle);
+            #[cfg(target_os = "macos")]
+            let show_on_launch = !to_tray || present_accessibility_guide;
+            #[cfg(not(target_os = "macos"))]
+            let show_on_launch = !to_tray;
+            if show_on_launch {
                 show_main(&handle);
             } else if let Some(w) = main_window(&handle) {
                 // Started at logon, or restarted after losing WebView2: hidden until the
                 // first hotkey.
                 set_low_memory(&w, true);
+            }
+            #[cfg(target_os = "macos")]
+            if present_accessibility_guide {
+                let prompt_on = handle.clone();
+                std::thread::spawn(move || {
+                    // Let the panel activate first. The consent dialog is easy to drop if
+                    // it is requested before the app is frontmost.
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let _ = prompt_on.run_on_main_thread(|| {
+                        if !win::accessibility_trusted() {
+                            win::log_diagnostic("accessibility-guide-presented");
+                            win::request_accessibility();
+                        }
+                    });
+                });
             }
             Ok(())
         })
@@ -2479,6 +2658,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_clips,
             get_clip_text,
+            save_clip_image,
             update_clip_text,
             get_capture_paused,
             toggle_capture_paused,
@@ -2520,7 +2700,11 @@ pub fn run() {
             get_storage_usage,
             update_settings,
             export_data,
-            import_data
+            import_data,
+            macos_setup_state,
+            open_accessibility_settings,
+            dismiss_accessibility_guide,
+            set_accessibility_guide_hold
         ])
         .run(tauri::generate_context!())
         .expect("error while running clipkeep");

@@ -40,6 +40,8 @@ pub struct Clip {
     #[serde(skip)]
     pub file: Option<String>,
     pub thumb: Option<String>,
+    /// Absolute path of the original PNG, filled in by `list_clips`.
+    pub image: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -85,6 +87,26 @@ pub enum Scope {
     All,
     Favorites,
     Group(i64),
+}
+
+/// Type filter for the panel list. This is not automatic grouping of related clips.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KindFilter {
+    All,
+    Text,
+    Image,
+    Color,
+}
+
+impl KindFilter {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "text" => Self::Text,
+            "image" => Self::Image,
+            "color" => Self::Color,
+            _ => Self::All,
+        }
+    }
 }
 
 pub fn now_ms() -> i64 {
@@ -332,16 +354,53 @@ fn delete_where(
     Ok(files)
 }
 
+#[cfg(test)]
 pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Vec<Clip>> {
+    list_with_kind(conn, scope, query, KindFilter::All)
+}
+
+pub fn list_with_kind(
+    conn: &Connection,
+    scope: Scope,
+    query: &str,
+    kind: KindFilter,
+) -> rusqlite::Result<Vec<Clip>> {
+    // Use the same Rust parser for SQL filtering and display; SQLite trim() only removes
+    // ASCII spaces. Register on this connection too (tests/import callers may use in-memory DBs).
+    conn.create_scalar_function(
+        "clipkeep_hex_color",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let text: String = ctx.get(0)?;
+            Ok(hex_color(&text))
+        },
+    )?;
     let mut filters: Vec<String> = Vec::new();
     match scope {
         Scope::All => {}
         Scope::Favorites => filters.push("favorite = 1".into()),
         Scope::Group(id) => filters.push(format!("group_id = {id}")),
     }
-    if !query.is_empty() {
-        filters.push("(kind = 'text' AND content LIKE ?1 ESCAPE '\\')".into());
+    match kind {
+        KindFilter::All => {}
+        KindFilter::Text => {
+            filters.push("kind = 'text' AND clipkeep_hex_color(content) IS NULL".into())
+        }
+        KindFilter::Image => filters.push("kind = 'image'".into()),
+        KindFilter::Color => {
+            filters.push("kind = 'text' AND clipkeep_hex_color(content) IS NOT NULL".into())
+        }
     }
+    if !query.is_empty() {
+        // Image rows store the file name in `content` and the original name in `source`.
+        filters.push(
+            "( (kind = 'text' AND content LIKE ?1 ESCAPE '\\') OR (kind = 'image' AND (content LIKE ?1 ESCAPE '\\' OR IFNULL(source, '') LIKE ?1 ESCAPE '\\')) )"
+                .into(),
+        );
+    }
+
     let where_clause = if filters.is_empty() {
         String::new()
     } else {
@@ -349,7 +408,8 @@ pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Ve
     };
     let sql = format!(
         "SELECT id, kind, CASE WHEN kind = 'image' THEN content ELSE COALESCE(preview, '') END,
-                size, length(CAST(preview AS BLOB)) < size, width, height, favorite, pinned, updated_at, source, group_id
+                size, length(CAST(preview AS BLOB)) < size, width, height, favorite, pinned, updated_at, source, group_id,
+                CASE WHEN kind = 'text' THEN clipkeep_hex_color(content) END
          FROM clips {where_clause} {ORDER} LIMIT {LIST_LIMIT}"
     );
     let pattern = format!(
@@ -365,12 +425,7 @@ pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Ve
         let body: String = r.get(2)?;
         let is_image = kind == KIND_IMAGE;
         let truncated = !is_image && r.get::<_, Option<bool>>(4)?.unwrap_or(false);
-        // A colour is a few characters, so a complete preview is the whole text.
-        let color = if is_image || truncated {
-            None
-        } else {
-            hex_color(&body)
-        };
+        let color: Option<String> = r.get(12)?;
         Ok(Clip {
             id: r.get(0)?,
             preview: if is_image {
@@ -391,6 +446,7 @@ pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Ve
             source: r.get(10)?,
             group_id: r.get(11)?,
             thumb: None,
+            image: None,
         })
     };
     let rows = if query.is_empty() {
@@ -785,7 +841,8 @@ mod tests {
         assert_eq!(color.color.as_deref(), Some("#2563EB"));
         assert_eq!(color.preview, original);
         assert_eq!(get(&conn, id).unwrap().unwrap().1, original);
-        assert_eq!(clips.iter().filter(|c| c.color.is_some()).count(), 1);
+        // A whitespace-padded color is recognized from full content even beyond the preview.
+        assert_eq!(clips.iter().filter(|c| c.color.is_some()).count(), 2);
     }
 
     #[test]
@@ -1061,5 +1118,106 @@ mod tests {
             })
             .unwrap();
         assert_eq!((count, fav), (1, 1));
+    }
+
+    fn add_image(conn: &Connection, file: &str, source: Option<&str>) -> i64 {
+        upsert(
+            conn,
+            &NewClip {
+                kind: KIND_IMAGE,
+                content: file,
+                hash: file,
+                width: Some(10),
+                height: Some(8),
+                size: 12,
+                source,
+            },
+            0,
+        )
+        .unwrap();
+        conn.query_row("SELECT id FROM clips WHERE hash = ?1", [file], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn search_matches_text_and_image_filenames() {
+        let conn = mem();
+        add(&conn, "hello screenshot", 16);
+        add_image(&conn, "abc123.png", Some("holiday-screenshot.png"));
+        add_image(&conn, "def456.png", Some("notes.jpg"));
+        let hits = list(&conn, Scope::All, "screenshot").unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|c| c.kind == KIND_TEXT));
+        assert!(
+            hits.iter()
+                .any(|c| c.source.as_deref() == Some("holiday-screenshot.png"))
+        );
+        let by_stored = list(&conn, Scope::All, "def456").unwrap();
+        assert_eq!(by_stored.len(), 1);
+        assert_eq!(by_stored[0].kind, KIND_IMAGE);
+    }
+
+    #[test]
+    fn list_filters_by_kind() {
+        let conn = mem();
+        add(&conn, "plain", 5);
+        add(&conn, "#2563eb", 7);
+        add_image(&conn, "pic.png", Some("pic.png"));
+        let texts = list_with_kind(&conn, Scope::All, "", KindFilter::Text).unwrap();
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].preview, "plain");
+        let colors = list_with_kind(&conn, Scope::All, "", KindFilter::Color).unwrap();
+        assert_eq!(colors.len(), 1);
+        assert_eq!(colors[0].color.as_deref(), Some("#2563eb"));
+        let images = list_with_kind(&conn, Scope::All, "", KindFilter::Image).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].kind, KIND_IMAGE);
+        assert_eq!(
+            list_with_kind(&conn, Scope::All, "pic", KindFilter::Image)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            list_with_kind(&conn, Scope::All, "pic", KindFilter::Text)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn color_filter_and_display_share_unicode_whitespace_rules() {
+        let conn = mem();
+        // Exercise every Unicode scalar that the production parser considers whitespace,
+        // rather than duplicating an incomplete hand-written whitespace table in SQL/tests.
+        let whitespace: String = (0..=0x10ffff)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_whitespace())
+            .collect();
+        for text in [
+            "\n#fff\n".to_owned(),
+            "\t#AbCd\r\n".to_owned(),
+            "\u{3000}#2563eb\u{a0}".to_owned(),
+            format!("{whitespace}#12345678{whitespace}"),
+            // Recognition must not depend on the list's preview/truncation boundary either.
+            format!("{}#abc", " ".repeat(PREVIEW_CHARS + 1)),
+            "not a color #fff".to_owned(),
+            "#12x".to_owned(),
+            "#fff #000".to_owned(),
+        ] {
+            add(&conn, &text, text.len() as i64);
+        }
+        let all = list(&conn, Scope::All, "").unwrap();
+        let colors = list_with_kind(&conn, Scope::All, "", KindFilter::Color).unwrap();
+        let texts = list_with_kind(&conn, Scope::All, "", KindFilter::Text).unwrap();
+        assert_eq!(colors.len(), 5);
+        assert_eq!(texts.len(), 3);
+        for row in all {
+            let full = get(&conn, row.id).unwrap().unwrap().1;
+            let expected = hex_color(&full);
+            assert_eq!(row.color, expected);
+            assert_eq!(colors.iter().any(|c| c.id == row.id), expected.is_some());
+            assert_eq!(texts.iter().any(|c| c.id == row.id), expected.is_none());
+        }
     }
 }
